@@ -18,7 +18,9 @@ const CLICK_COOLDOWN: Duration = Duration::from_millis(350);
 
 const MIN_HAND_SPAN: f32 = 0.12;
 
-const VOLUME_LOCK: Duration = Duration::from_millis(500);
+const FLIP_VEL: f32 = 1.5; // normalized Y units per second for a vertical flip
+const VOLUME_FLIP_COOLDOWN: Duration = Duration::from_millis(600);
+const VOLUME_STEP: u32 = 5; // percent change per flip
 const SWIPE_VEL: f32 = 1.8; // normalized X units per second
 const SWIPE_COOLDOWN: Duration = Duration::from_millis(1000);
 const FIST_COOLDOWN: Duration = Duration::from_millis(1000);
@@ -112,19 +114,13 @@ fn palm_centroid(lm: &[[f32; 3]]) -> [f32; 2] {
     sum
 }
 
-fn volume_percent_from_y(y: f32) -> u32 {
-    let pct = 1.0 - y.clamp(0.0, 1.0);
-    let stepped = (pct * 20.0).round() / 20.0;
-    (stepped * 100.0) as u32
-}
-
 // ---------------------------------------------------------------------------
-// Volume control via pactl
+// Volume control via pactl (relative steps)
 // ---------------------------------------------------------------------------
-fn set_volume(percent: u32) -> Result<()> {
-    let pct = percent.clamp(0, 100);
+fn adjust_volume(up: bool, step: u32) -> Result<()> {
+    let sign = if up { "+" } else { "-" };
     Command::new("pactl")
-        .args(["set-sink-volume", "@DEFAULT_SINK@", &format!("{}%", pct)])
+        .args(["set-sink-volume", "@DEFAULT_SINK@", &format!("{}{}%", sign, step)])
         .status()
         .context("failed to run pactl")?;
     Ok(())
@@ -142,8 +138,7 @@ struct Controller {
     click_ready: bool,
     click_timer: Instant,
 
-    volume_active_since: Option<Instant>,
-    current_volume: Option<u32>,
+    last_volume_flip: Instant,
 
     palm_positions: Vec<[f32; 2]>,
     palm_times: Vec<Instant>,
@@ -191,8 +186,7 @@ impl Controller {
             virtual_input,
             click_ready: true,
             click_timer: Instant::now(),
-            volume_active_since: None,
-            current_volume: None,
+            last_volume_flip: Instant::now(),
             palm_positions: Vec::with_capacity(10),
             palm_times: Vec::with_capacity(10),
             last_swipe: Instant::now(),
@@ -256,27 +250,9 @@ impl Controller {
             self.click_ready = true;
         }
 
-        // Volume (open palm)
-        if is_open_hand(&fingers) {
-            if self.volume_active_since.is_none() {
-                self.volume_active_since = Some(now);
-            }
-            if now.duration_since(self.volume_active_since.unwrap()) > VOLUME_LOCK {
-                let pct = volume_percent_from_y(lm[0][1]);
-                if self.current_volume != Some(pct) {
-                    if self.dry_run {
-                        println!("[GESTURE] volume {}%", pct);
-                    } else {
-                        set_volume(pct)?;
-                    }
-                    self.current_volume = Some(pct);
-                }
-            }
-        } else {
-            self.volume_active_since = None;
-        }
+        // Volume is handled by vertical flips in detect_swipe_or_fist().
 
-        // Cursor: point index finger (full open palm should control volume, not the cursor).
+        // Cursor: point index finger (an open palm is reserved for swipes/volume flips).
         if is_index_pointing(&fingers) {
             self.move_cursor(lm)?;
         }
@@ -390,11 +366,31 @@ impl Controller {
         }
 
         let xs: Vec<f32> = self.palm_positions.iter().map(|p| p[0]).collect();
+        let ys: Vec<f32> = self.palm_positions.iter().map(|p| p[1]).collect();
         let dt = self.palm_times.last().unwrap().duration_since(self.palm_times[0]).as_secs_f32();
         if dt == 0.0 {
             return Ok(());
         }
         let vx = (xs.last().unwrap() - xs.first().unwrap()) / dt;
+        let vy = (ys.last().unwrap() - ys.first().unwrap()) / dt;
+
+        // Vertical flip -> volume step. Require the motion to be predominantly
+        // vertical so it does not steal horizontal swipes.
+        if now.duration_since(self.last_volume_flip) > VOLUME_FLIP_COOLDOWN && vy.abs() > vx.abs() {
+            if vy < -FLIP_VEL {
+                self.volume_flip(true)?; // flip up -> volume up
+                self.last_volume_flip = now;
+                self.palm_positions.clear();
+                self.palm_times.clear();
+                return Ok(());
+            } else if vy > FLIP_VEL {
+                self.volume_flip(false)?; // flip down -> volume down
+                self.last_volume_flip = now;
+                self.palm_positions.clear();
+                self.palm_times.clear();
+                return Ok(());
+            }
+        }
 
         if now.duration_since(self.last_swipe) > SWIPE_COOLDOWN {
             if vx > SWIPE_VEL {
@@ -407,6 +403,14 @@ impl Controller {
         }
 
         Ok(())
+    }
+
+    fn volume_flip(&mut self, up: bool) -> Result<()> {
+        if self.dry_run {
+            println!("[GESTURE] volume {}", if up { "up" } else { "down" });
+            return Ok(());
+        }
+        adjust_volume(up, VOLUME_STEP)
     }
 
     fn switch_tab(&mut self, direction: &str) -> Result<()> {

@@ -32,7 +32,7 @@ Press **Ctrl+C** to stop.
 | Point index finger | Move cursor |
 | Pinch thumb + index | Left click |
 | Pinch thumb + middle | Right click |
-| Open palm, raise/lower hand | Change system volume |
+| Open palm, flip up / down | Increase / decrease volume |
 | Open palm, swipe left/right | Switch browser/app tabs |
 | Closed fist | Close current tab (`Ctrl+W`) |
 | Flip hand left / right | Switch workspace / virtual desktop |
