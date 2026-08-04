@@ -54,6 +54,7 @@ The release binary is at `./target/release/air-mouse`.
 - Volume changes use `pactl`. If you use PipeWire, make sure the PulseAudio compatibility socket is running.
 - On Wayland, Enigo/X11 mouse and keyboard injection may need accessibility/remote-desktop permissions.
 - If the cursor feels jumpy from hand shake, lower `CURSOR_ALPHA` in `src/main.rs`. If it feels too slow or too fast, change `CURSOR_GAIN`.
+- If volume flips are hard to trigger (or fire too easily), adjust `FLIP_VEL` in `src/main.rs` (lower = more sensitive). To change how much each flip changes the volume, edit `VOLUME_STEP` (percent per flip); to allow faster repeated flips, lower `VOLUME_FLIP_COOLDOWN`.
 - A fully native Rust inference pipeline is possible but would require re-implementing MediaPipe’s model decoder (anchors, NMS, rotation, landmarks). This hybrid is the practical fast path.
 
 # hand-control-rust
