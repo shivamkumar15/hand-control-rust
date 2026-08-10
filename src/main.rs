@@ -3,7 +3,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use evdev::Key as EvKey;
 use serde::Deserialize;
 
@@ -34,7 +34,7 @@ const SHUTDOWN_DOWN_THRESHOLD: f32 = 0.22;
 const SHUTDOWN_COOLDOWN: Duration = Duration::from_secs(5);
 
 const MOUSE_REGION: (f32, f32, f32, f32) = (0.1, 0.1, 0.9, 0.7); // x_min, y_min, x_max, y_max
-const CURSOR_GAIN: f32 = 1.8; // >1 increases sensitivity; movement is amplified around the center
+const CURSOR_GAIN: f32 = 2.5; // >1 increases sensitivity; movement is amplified around the center
 const CURSOR_ALPHA: f32 = 0.18; // exponential moving average factor (lower = smoother)
 const CURSOR_MIN_MOVE_PX: f32 = 1.5; // ignore sub-pixel jitter
 
@@ -103,6 +103,11 @@ fn is_index_pointing(fingers: &[bool; 5]) -> bool {
     fingers[1] && !is_open_hand(fingers)
 }
 
+fn is_two_fingers(fingers: &[bool; 5]) -> bool {
+    // Index and middle fingers extended, ring and pinky closed.
+    fingers[1] && fingers[2] && !fingers[3] && !fingers[4]
+}
+
 fn palm_centroid(lm: &[[f32; 3]]) -> [f32; 2] {
     let mut sum = [0.0; 2];
     for i in [0, 5, 17] {
@@ -147,6 +152,7 @@ struct Controller {
 
     last_handedness: Option<String>,
     last_workspace_switch: Instant,
+    last_two_finger_y: Option<f32>,
 
     clap_count: u32,
     last_clap_time: Instant,
@@ -194,6 +200,7 @@ impl Controller {
 
             last_handedness: None,
             last_workspace_switch: Instant::now(),
+            last_two_finger_y: None,
 
             clap_count: 0,
             last_clap_time: Instant::now(),
@@ -253,7 +260,13 @@ impl Controller {
         // Volume is handled by vertical flips in detect_swipe_or_fist().
 
         // Cursor: point index finger (an open palm is reserved for swipes/volume flips).
-        if is_index_pointing(&fingers) {
+        if is_two_fingers(&fingers) {
+            self.handle_scroll(lm)?;
+        } else {
+            self.last_two_finger_y = None;
+        }
+
+        if is_index_pointing(&fingers) && !is_two_fingers(&fingers) {
             self.move_cursor(lm)?;
         }
 
@@ -290,6 +303,31 @@ impl Controller {
         }
         self.click_ready = false;
         self.click_timer = now;
+        Ok(())
+    }
+
+    fn handle_scroll(&mut self, lm: &[[f32; 3]]) -> Result<()> {
+        // Average Y position of index and middle finger tips
+        let current_y = (lm[8][1] + lm[12][1]) / 2.0;
+
+        if let Some(last_y) = self.last_two_finger_y {
+            let dy = current_y - last_y;
+            // Scroll threshold and multiplier
+            let scroll_threshold = 0.02; 
+            if dy.abs() > scroll_threshold {
+                let scroll_amount = if dy > 0.0 { -1 } else { 1 }; // Invert for natural scrolling
+                if !self.dry_run {
+                    self.scroll_mouse(scroll_amount)?;
+                } else {
+                    println!("[GESTURE] scroll {}", scroll_amount);
+                }
+                // Only update last_y when a scroll is triggered to accumulate small movements
+                self.last_two_finger_y = Some(current_y);
+            }
+        } else {
+            self.last_two_finger_y = Some(current_y);
+        }
+
         Ok(())
     }
 
@@ -577,6 +615,16 @@ impl Controller {
             self.enigo
                 .move_mouse(x, y, Coordinate::Abs)
                 .context("mouse move failed")
+        }
+    }
+
+    fn scroll_mouse(&mut self, y: i32) -> Result<()> {
+        if let Some(vi) = &mut self.virtual_input {
+            vi.scroll(y)
+        } else {
+            self.enigo
+                .scroll(y, Axis::Vertical)
+                .context("mouse scroll failed")
         }
     }
 

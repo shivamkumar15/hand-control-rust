@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use enigo::Button;
 use evdev::{
     uinput::VirtualDeviceBuilder, AbsInfo, AbsoluteAxisType, AttributeSet, EventType, InputEvent,
-    Key as EvKey, Synchronization, UinputAbsSetup,
+    Key as EvKey, RelativeAxisType, Synchronization, UinputAbsSetup,
 };
 
 /// Native Linux virtual input device (uinput). Works on both X11 and Wayland,
@@ -34,6 +34,9 @@ impl VirtualInput {
             AbsInfo::new(0, 0, height, 0, 0, 1),
         );
 
+        let mut rel_axes = AttributeSet::<RelativeAxisType>::new();
+        rel_axes.insert(RelativeAxisType::REL_WHEEL);
+
         let device = VirtualDeviceBuilder::new()
             .context("/dev/uinput not available; are you in the 'input' group?")?
             .name(name)
@@ -43,10 +46,19 @@ impl VirtualInput {
             .context("failed to register ABS_Y axis")?
             .with_keys(&keys)
             .context("failed to register keys")?
+            .with_relative_axes(&rel_axes)
+            .context("failed to register rel axes")?
             .build()
             .context("failed to create uinput device")?;
 
         Ok(Self { device })
+    }
+
+    pub fn scroll(&mut self, y: i32) -> Result<()> {
+        self.emit(&[
+            InputEvent::new(EventType::RELATIVE, RelativeAxisType::REL_WHEEL.0, y),
+            InputEvent::new(EventType::SYNCHRONIZATION, Synchronization::SYN_REPORT.0, 0),
+        ])
     }
 
     pub fn move_mouse(&mut self, x: i32, y: i32) -> Result<()> {
