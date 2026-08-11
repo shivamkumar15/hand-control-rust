@@ -34,8 +34,8 @@ const SHUTDOWN_DOWN_THRESHOLD: f32 = 0.22;
 const SHUTDOWN_COOLDOWN: Duration = Duration::from_secs(5);
 
 const MOUSE_REGION: (f32, f32, f32, f32) = (0.1, 0.1, 0.9, 0.7); // x_min, y_min, x_max, y_max
-const CURSOR_GAIN: f32 = 2.5; // >1 increases sensitivity; movement is amplified around the center
-const CURSOR_ALPHA: f32 = 0.18; // exponential moving average factor (lower = smoother)
+const CURSOR_GAIN: f32 = 3.5; // >1 increases sensitivity; movement is amplified around the center
+const CURSOR_ALPHA: f32 = 0.22; // exponential moving average factor (lower = smoother)
 const CURSOR_MIN_MOVE_PX: f32 = 1.5; // ignore sub-pixel jitter
 
 // ---------------------------------------------------------------------------
