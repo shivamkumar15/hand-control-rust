@@ -1,6 +1,5 @@
 # Air Mouse — Rust controller
 
-Fast native controller for hand gesture laptop control.
 
 ## Architecture
 
