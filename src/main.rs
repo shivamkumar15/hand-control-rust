@@ -21,10 +21,13 @@ const MIN_HAND_SPAN: f32 = 0.12;
 const FLIP_VEL: f32 = 1.5; // normalized Y units per second for a vertical flip
 const VOLUME_FLIP_COOLDOWN: Duration = Duration::from_millis(600);
 const VOLUME_STEP: u32 = 5; // percent change per flip
-const SWIPE_VEL: f32 = 1.8; // normalized X units per second
-const SWIPE_COOLDOWN: Duration = Duration::from_millis(1000);
 const FIST_COOLDOWN: Duration = Duration::from_millis(1000);
-const WORKSPACE_COOLDOWN: Duration = Duration::from_millis(900);
+
+// Tilt-wave workspace switching: rock the open hand sideways about the wrist.
+const TILT_FIRE_DEG: f32 = 25.0; // tilt angle that triggers a switch
+const TILT_ARM_DEG: f32 = 17.0; // hand must return below this to re-arm
+const TILT_ALPHA: f32 = 0.45; // EMA factor for tilt smoothing
+const WORKSPACE_COOLDOWN: Duration = Duration::from_millis(350);
 
 const CLAP_THRESHOLD: f32 = 0.12;
 const CLAP_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -74,24 +77,31 @@ fn hand_span(lm: &[[f32; 3]]) -> f32 {
 }
 
 fn fingers_up(lm: &[[f32; 3]]) -> [bool; 5] {
+    // Orientation-independent: a finger is extended when its tip is farther
+    // from the wrist than its PIP joint. Works for upright AND tilted hands.
     let tips = [8, 12, 16, 20];
     let pips = [6, 10, 14, 18];
     let mut up = [false; 5];
 
-    // Thumb heuristic: compare distance from wrist (0) to tip vs wrist to IP (3)
     let wrist = lm[0];
-    let thumb_tip = lm[4];
-    let thumb_ip = lm[3];
-    up[0] = dist(&wrist, &thumb_tip) > dist(&wrist, &thumb_ip);
+
+    // Thumb: tip farther from wrist than its IP joint.
+    up[0] = dist(&wrist, &lm[4]) > dist(&wrist, &lm[3]);
 
     for i in 0..4 {
-        up[i + 1] = lm[tips[i]][1] < lm[pips[i]][1]; // y grows downward
+        up[i + 1] = dist(&wrist, &lm[tips[i]]) > dist(&wrist, &lm[pips[i]]);
     }
     up
 }
 
 fn is_open_hand(fingers: &[bool; 5]) -> bool {
     fingers.iter().all(|&x| x)
+}
+
+/// Four fingers extended; ignores the thumb so a sideways "knife" hand
+/// (as used for swipes) still counts as open.
+fn is_swipe_hand(fingers: &[bool; 5]) -> bool {
+    fingers[1] && fingers[2] && fingers[3] && fingers[4]
 }
 
 fn is_fist(fingers: &[bool; 5]) -> bool {
@@ -117,6 +127,15 @@ fn palm_centroid(lm: &[[f32; 3]]) -> [f32; 2] {
     sum[0] /= 3.0;
     sum[1] /= 3.0;
     sum
+}
+
+/// Tilt of the hand about the wrist in degrees. 0 = upright, positive = the
+/// fingers lean to the right, negative = to the left. Uses the
+/// wrist -> middle-knuckle vector so it works regardless of translation.
+fn hand_tilt_deg(lm: &[[f32; 3]]) -> f32 {
+    let dx = lm[9][0] - lm[0][0];
+    let dy = lm[9][1] - lm[0][1]; // y grows downward
+    dx.atan2(-dy).to_degrees()
 }
 
 // ---------------------------------------------------------------------------
@@ -147,10 +166,10 @@ struct Controller {
 
     palm_positions: Vec<[f32; 2]>,
     palm_times: Vec<Instant>,
-    last_swipe: Instant,
     last_fist: Instant,
 
-    last_handedness: Option<String>,
+    tilt_armed: bool,
+    tilt_ema: Option<f32>,
     last_workspace_switch: Instant,
     last_two_finger_y: Option<f32>,
 
@@ -195,10 +214,10 @@ impl Controller {
             last_volume_flip: Instant::now(),
             palm_positions: Vec::with_capacity(10),
             palm_times: Vec::with_capacity(10),
-            last_swipe: Instant::now(),
             last_fist: Instant::now(),
 
-            last_handedness: None,
+            tilt_armed: true,
+            tilt_ema: None,
             last_workspace_switch: Instant::now(),
             last_two_finger_y: None,
 
@@ -217,7 +236,6 @@ impl Controller {
     fn process(
         &mut self,
         lm: &[[f32; 3]],
-        handedness: Option<&str>,
     ) -> Result<()> {
         let span = hand_span(lm);
         if span < MIN_HAND_SPAN {
@@ -272,24 +290,6 @@ impl Controller {
 
         // Swipes / fist
         self.detect_swipe_or_fist(lm, now)?;
-
-        // Workspace switch on hand flip (detected by handedness change).
-        if let Some(h) = handedness
-            && now.duration_since(self.last_workspace_switch) > WORKSPACE_COOLDOWN
-        {
-            match (self.last_handedness.as_deref(), h) {
-                (Some("Right"), "Left") => {
-                    self.switch_workspace("left")?;
-                    self.last_workspace_switch = now;
-                }
-                (Some("Left"), "Right") => {
-                    self.switch_workspace("right")?;
-                    self.last_workspace_switch = now;
-                }
-                _ => {}
-            }
-            self.last_handedness = Some(h.to_string());
-        }
 
         Ok(())
     }
@@ -399,7 +399,7 @@ impl Controller {
             return Ok(());
         }
 
-        if !is_open_hand(&fingers) || self.palm_positions.len() < 3 {
+        if self.palm_positions.len() < 3 {
             return Ok(());
         }
 
@@ -412,9 +412,50 @@ impl Controller {
         let vx = (xs.last().unwrap() - xs.first().unwrap()) / dt;
         let vy = (ys.last().unwrap() - ys.first().unwrap()) / dt;
 
-        // Vertical flip -> volume step. Require the motion to be predominantly
-        // vertical so it does not steal horizontal swipes.
-        if now.duration_since(self.last_volume_flip) > VOLUME_FLIP_COOLDOWN && vy.abs() > vx.abs() {
+        // Tilt-wave -> workspace switch. Gate is deliberately loose: during a
+        // fast wave, motion blur makes MediaPipe drop fingers, so requiring
+        // all four extended misses most attempts. Edge-triggered: fires when
+        // the smoothed tilt passes TILT_FIRE_DEG, re-arms below TILT_ARM_DEG.
+        let ext = fingers[1] as i32 + fingers[2] as i32 + fingers[3] as i32 + fingers[4] as i32;
+        if !is_fist(&fingers) && ext >= 2 {
+            let raw = hand_tilt_deg(lm);
+            // Smooth to reject landmark jitter on the short wrist->knuckle vector.
+            let smooth = match self.tilt_ema {
+                Some(t) => t + TILT_ALPHA * (raw - t),
+                None => raw,
+            };
+            self.tilt_ema = Some(smooth);
+
+            if self.debug {
+                eprintln!(
+                    "[TILT] raw={raw:+.1} smooth={smooth:+.1} (fire ±{TILT_FIRE_DEG}, armed={})",
+                    self.tilt_armed
+                );
+            }
+
+            if !self.tilt_armed {
+                if smooth.abs() < TILT_ARM_DEG {
+                    self.tilt_armed = true;
+                }
+            } else if smooth.abs() >= TILT_FIRE_DEG
+                && now.duration_since(self.last_workspace_switch) > WORKSPACE_COOLDOWN
+            {
+                // Tilt right -> previous workspace, tilt left -> next.
+                self.switch_workspace(if smooth > 0.0 { "left" } else { "right" })?;
+                self.last_workspace_switch = now;
+                self.tilt_armed = false;
+            }
+        } else {
+            // Hand closed or gone: reset smoothing for the next wave.
+            self.tilt_ema = None;
+        }
+
+        // Vertical flip -> volume step. Requires a clearly open hand and
+        // predominantly vertical motion so it does not steal tilt-waves.
+        if is_swipe_hand(&fingers)
+            && now.duration_since(self.last_volume_flip) > VOLUME_FLIP_COOLDOWN
+            && vy.abs() > vx.abs()
+        {
             if vy < -FLIP_VEL {
                 self.volume_flip(true)?; // flip up -> volume up
                 self.last_volume_flip = now;
@@ -430,16 +471,6 @@ impl Controller {
             }
         }
 
-        if now.duration_since(self.last_swipe) > SWIPE_COOLDOWN {
-            if vx > SWIPE_VEL {
-                self.switch_tab("right")?;
-                self.last_swipe = now;
-            } else if vx < -SWIPE_VEL {
-                self.switch_tab("left")?;
-                self.last_swipe = now;
-            }
-        }
-
         Ok(())
     }
 
@@ -451,27 +482,23 @@ impl Controller {
         adjust_volume(up, VOLUME_STEP)
     }
 
-    fn switch_tab(&mut self, direction: &str) -> Result<()> {
-        if self.dry_run {
-            println!("[GESTURE] switch tab {}", direction);
-            return Ok(());
-        }
-        if direction == "right" {
-            self.key_combo(&[EvKey::KEY_LEFTCTRL], EvKey::KEY_TAB)?;
-        } else {
-            self.key_combo(
-                &[EvKey::KEY_LEFTCTRL, EvKey::KEY_LEFTSHIFT],
-                EvKey::KEY_TAB,
-            )?;
-        }
-        Ok(())
-    }
-
     fn switch_workspace(&mut self, direction: &str) -> Result<()> {
         if self.dry_run {
             println!("[GESTURE] switch workspace {}", direction);
             return Ok(());
         }
+
+        // Hyprland does not bind Ctrl+Alt+arrows by default, so talk to it
+        // directly instead of injecting keys.
+        if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() && command_exists("hyprctl") {
+            let delta = if direction == "left" { "e-1" } else { "e+1" };
+            return Command::new("hyprctl")
+                .args(["dispatch", "workspace", delta])
+                .status()
+                .context("hyprctl failed")
+                .map(|_| ());
+        }
+
         if let Some(vi) = &mut self.virtual_input {
             let key = match direction {
                 "left" => EvKey::KEY_LEFT,
@@ -735,7 +762,7 @@ fn main() -> Result<()> {
 
             if let Some(hand) = primary {
                 let lm = &hand.landmarks;
-                if lm.len() >= 21 && let Err(e) = ctrl.process(lm, hand.handedness.as_deref()) {
+                if lm.len() >= 21 && let Err(e) = ctrl.process(lm) {
                     eprintln!("process error: {e:?}");
                 }
             }

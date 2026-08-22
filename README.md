@@ -33,9 +33,8 @@ Press **Ctrl+C** to stop.
 | Pinch thumb + index | Left click |
 | Pinch thumb + middle | Right click |
 | Open palm, flip up / down | Increase / decrease volume |
-| Open palm, swipe left/right | Switch browser/app tabs |
+| Open palm, wave/tilt left-right (like saying "no") | Switch workspace / virtual desktop |
 | Closed fist | Close current tab (`Ctrl+W`) |
-| Flip hand left / right | Switch workspace / virtual desktop |
 | Clap twice, then lower right hand | Shut down the system |
 
 > **Warning:** The shutdown gesture is active in non-dry-run mode and calls `systemctl poweroff` with a 2-second delay. Make sure you can cancel it (`Ctrl+C` in the terminal) while testing.
