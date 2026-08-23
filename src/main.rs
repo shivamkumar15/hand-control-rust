@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -12,22 +13,47 @@ mod input;
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
-const CLICK_THRESHOLD: f32 = 0.035;
-const CLICK_THRESHOLD_REL: f32 = 0.35; // relative to palm size
-const CLICK_COOLDOWN: Duration = Duration::from_millis(350);
+const MIN_HAND_SPAN: f32 = 0.06; // reject spurious tiny detections
 
-const MIN_HAND_SPAN: f32 = 0.12;
+// Pinch clicks (thumb + index / thumb + middle). Fire when tips come close,
+// re-arm only after they separate again -> no machine-gun clicking.
+const PINCH_ON: f32 = 0.045;
+const PINCH_OFF: f32 = 0.08;
+const PINCH_PALM_REL: f32 = 0.30; // also relative to palm size
+const CLICK_COOLDOWN: Duration = Duration::from_millis(180);
 
-const FLIP_VEL: f32 = 1.5; // normalized Y units per second for a vertical flip
-const VOLUME_FLIP_COOLDOWN: Duration = Duration::from_millis(600);
-const VOLUME_STEP: u32 = 5; // percent change per flip
-const FIST_COOLDOWN: Duration = Duration::from_millis(1000);
+// Cursor: the full camera view (minus a small margin) maps to the whole
+// screen. No saturating gain — every hand position is reachable.
+const MARGIN: f32 = 0.08;
+const CURSOR_JITTER_PX: f32 = 1.5; // ignore sub-pixel shake
+const SMOOTH_MIN: f32 = 0.10; // smoothing for slow movement
+const SMOOTH_MAX: f32 = 1.0; // fast movement snaps instantly
+const SMOOTH_RANGE_PX: f32 = 120.0; // distance over which smoothing ramps up
 
-// Tilt-wave workspace switching: rock the open hand sideways about the wrist.
-const TILT_FIRE_DEG: f32 = 25.0; // tilt angle that triggers a switch
-const TILT_ARM_DEG: f32 = 17.0; // hand must return below this to re-arm
-const TILT_ALPHA: f32 = 0.45; // EMA factor for tilt smoothing
-const WORKSPACE_COOLDOWN: Duration = Duration::from_millis(350);
+// Two-finger scroll: displacement-based (frame-rate independent), needs the
+// gesture held briefly so transitions don't emit stray ticks.
+const SCROLL_TICK: f32 = 0.035; // fingertip travel per wheel tick (normalized)
+const SCROLL_SETTLE: Duration = Duration::from_millis(120);
+const SCROLL_MAX_TICKS: i32 = 3;
+
+// Open-palm gestures are velocity-gated so merely holding/rotating the hand
+// does nothing until you actually wave or flip it.
+const WAVE_VEL: f32 = 0.70; // normalized units / second
+const FLIP_VEL: f32 = 0.85;
+const DOMINANCE: f32 = 1.3; // axis must beat the other by this factor
+const TILT_FIRE_DEG: f32 = 24.0;
+const TILT_ARM_DEG: f32 = 14.0;
+const TILT_ALPHA: f32 = 0.45;
+const WORKSPACE_COOLDOWN: Duration = Duration::from_millis(400);
+const VOLUME_FLIP_COOLDOWN: Duration = Duration::from_millis(500);
+const VOLUME_STEP: u32 = 5;
+
+// Fist: must be HELD to fire, fires once, and re-arms only after the hand
+// opens again. Transitions through a half-closed hand never close tabs.
+const FIST_HOLD: Duration = Duration::from_millis(400);
+const FIST_REARM: Duration = Duration::from_millis(400);
+const FINGER_STRAIGHT_DEG: f32 = 145.0; // joint angle above this = extended
+const FIST_MAX_WRIST_Y: f32 = 0.60; // fist must be raised; low/resting hands never fire
 
 const CLAP_THRESHOLD: f32 = 0.12;
 const CLAP_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -35,11 +61,6 @@ const CLAP_COOLDOWN: Duration = Duration::from_millis(300);
 const AFTER_CLAP_WINDOW: Duration = Duration::from_millis(2500);
 const SHUTDOWN_DOWN_THRESHOLD: f32 = 0.22;
 const SHUTDOWN_COOLDOWN: Duration = Duration::from_secs(5);
-
-const MOUSE_REGION: (f32, f32, f32, f32) = (0.1, 0.1, 0.9, 0.7); // x_min, y_min, x_max, y_max
-const CURSOR_GAIN: f32 = 3.5; // >1 increases sensitivity; movement is amplified around the center
-const CURSOR_ALPHA: f32 = 0.22; // exponential moving average factor (lower = smoother)
-const CURSOR_MIN_MOVE_PX: f32 = 1.5; // ignore sub-pixel jitter
 
 // ---------------------------------------------------------------------------
 // Landmark data from Python tracker
@@ -56,17 +77,21 @@ struct Frame {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Geometry helpers
 // ---------------------------------------------------------------------------
 fn dist(a: &[f32; 3], b: &[f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
 }
 
+fn dist2d(a: &[f32; 2], b: &[f32; 2]) -> f32 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
+}
+
 fn hand_span(lm: &[[f32; 3]]) -> f32 {
-    let mut min_x = 1.0f32;
-    let mut max_x = 0.0f32;
-    let mut min_y = 1.0f32;
-    let mut max_y = 0.0f32;
+    let mut min_x = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut min_y = f32::MAX;
+    let mut max_y = f32::MIN;
     for p in lm {
         min_x = min_x.min(p[0]);
         max_x = max_x.max(p[0]);
@@ -76,46 +101,32 @@ fn hand_span(lm: &[[f32; 3]]) -> f32 {
     (max_x - min_x).max(max_y - min_y)
 }
 
-fn fingers_up(lm: &[[f32; 3]]) -> [bool; 5] {
-    // Orientation-independent: a finger is extended when its tip is farther
-    // from the wrist than its PIP joint. Works for upright AND tilted hands.
-    let tips = [8, 12, 16, 20];
-    let pips = [6, 10, 14, 18];
-    let mut up = [false; 5];
-
-    let wrist = lm[0];
-
-    // Thumb: tip farther from wrist than its IP joint.
-    up[0] = dist(&wrist, &lm[4]) > dist(&wrist, &lm[3]);
-
-    for i in 0..4 {
-        up[i + 1] = dist(&wrist, &lm[tips[i]]) > dist(&wrist, &lm[pips[i]]);
+/// Angle at joint `b` of the triangle a-b-c, in degrees. Straight = ~180.
+fn joint_angle(a: &[f32; 3], b: &[f32; 3], c: &[f32; 3]) -> f32 {
+    let v1 = [a[0] - b[0], a[1] - b[1]];
+    let v2 = [c[0] - b[0], c[1] - b[1]];
+    let m1 = (v1[0] * v1[0] + v1[1] * v1[1]).sqrt();
+    let m2 = (v2[0] * v2[0] + v2[1] * v2[1]).sqrt();
+    if m1 < 1e-6 || m2 < 1e-6 {
+        return 180.0;
     }
-    up
+    ((v1[0] * v2[0] + v1[1] * v2[1]) / (m1 * m2))
+        .clamp(-1.0, 1.0)
+        .acos()
+        .to_degrees()
 }
 
-fn is_open_hand(fingers: &[bool; 5]) -> bool {
-    fingers.iter().all(|&x| x)
-}
-
-/// Four fingers extended; ignores the thumb so a sideways "knife" hand
-/// (as used for swipes) still counts as open.
-fn is_swipe_hand(fingers: &[bool; 5]) -> bool {
-    fingers[1] && fingers[2] && fingers[3] && fingers[4]
-}
-
-fn is_fist(fingers: &[bool; 5]) -> bool {
-    fingers.iter().all(|&x| !x)
-}
-
-fn is_index_pointing(fingers: &[bool; 5]) -> bool {
-    // Index finger extended, but hand is not a full open palm.
-    fingers[1] && !is_open_hand(fingers)
-}
-
-fn is_two_fingers(fingers: &[bool; 5]) -> bool {
-    // Index and middle fingers extended, ring and pinky closed.
-    fingers[1] && fingers[2] && !fingers[3] && !fingers[4]
+/// A finger is extended when its PIP joint is straight. Unlike tip-vs-wrist
+/// distance this is orientation-independent and correctly reports FOLDED for
+/// a thumb tucked into a fist.
+fn fingers_up(lm: &[[f32; 3]]) -> [bool; 5] {
+    [
+        joint_angle(&lm[2], &lm[3], &lm[4]) > FINGER_STRAIGHT_DEG, // thumb
+        joint_angle(&lm[5], &lm[6], &lm[8]) > FINGER_STRAIGHT_DEG, // index
+        joint_angle(&lm[9], &lm[10], &lm[12]) > FINGER_STRAIGHT_DEG, // middle
+        joint_angle(&lm[13], &lm[14], &lm[16]) > FINGER_STRAIGHT_DEG, // ring
+        joint_angle(&lm[17], &lm[18], &lm[20]) > FINGER_STRAIGHT_DEG, // pinky
+    ]
 }
 
 fn palm_centroid(lm: &[[f32; 3]]) -> [f32; 2] {
@@ -124,18 +135,38 @@ fn palm_centroid(lm: &[[f32; 3]]) -> [f32; 2] {
         sum[0] += lm[i][0];
         sum[1] += lm[i][1];
     }
-    sum[0] /= 3.0;
-    sum[1] /= 3.0;
-    sum
+    [sum[0] / 3.0, sum[1] / 3.0]
 }
 
-/// Tilt of the hand about the wrist in degrees. 0 = upright, positive = the
-/// fingers lean to the right, negative = to the left. Uses the
-/// wrist -> middle-knuckle vector so it works regardless of translation.
+/// Tilt of the fingers about the wrist in degrees. Positive = leaning right.
 fn hand_tilt_deg(lm: &[[f32; 3]]) -> f32 {
     let dx = lm[9][0] - lm[0][0];
     let dy = lm[9][1] - lm[0][1]; // y grows downward
     dx.atan2(-dy).to_degrees()
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Mode {
+    Idle,
+    Cursor,
+    Scroll,
+    Palm,
+}
+
+impl Mode {
+    fn label(self) -> &'static str {
+        match self {
+            Mode::Idle => "idle",
+            Mode::Cursor => "cursor",
+            Mode::Scroll => "scroll",
+            Mode::Palm => "palm",
+        }
+    }
+}
+
+struct Sample {
+    t: Instant,
+    p: [f32; 2],
 }
 
 // ---------------------------------------------------------------------------
@@ -156,22 +187,34 @@ fn adjust_volume(up: bool, step: u32) -> Result<()> {
 struct Controller {
     enigo: Enigo,
     screen_size: (i32, i32),
-    cursor_ema: Option<[f32; 2]>,
     virtual_input: Option<input::VirtualInput>,
+    dry_run: bool,
+    debug: bool,
 
-    click_ready: bool,
-    click_timer: Instant,
+    mode: Mode,
+    last_status: String,
 
-    last_volume_flip: Instant,
+    cursor_ema: Option<[f32; 2]>,
 
-    palm_positions: Vec<[f32; 2]>,
-    palm_times: Vec<Instant>,
-    last_fist: Instant,
+    pinch_left_armed: bool,
+    pinch_right_armed: bool,
+    last_click: Instant,
 
-    tilt_armed: bool,
+    hist: VecDeque<Sample>,
+
+    scroll_entered: Option<Instant>,
+    scroll_last_y: Option<f32>,
+    scroll_acc: f32,
+
+    fist_since: Option<Instant>,
+    fist_fired: bool,
+    last_fist_fire: Instant,
+
     tilt_ema: Option<f32>,
+    tilt_armed: bool,
+    vol_armed: bool,
     last_workspace_switch: Instant,
-    last_two_finger_y: Option<f32>,
+    last_volume_flip: Instant,
 
     clap_count: u32,
     last_clap_time: Instant,
@@ -179,9 +222,6 @@ struct Controller {
     shutdown_window_until: Option<Instant>,
     right_hand_start_y: Option<f32>,
     last_shutdown: Option<Instant>,
-
-    dry_run: bool,
-    debug: bool,
 }
 
 impl Controller {
@@ -207,219 +247,275 @@ impl Controller {
         Ok(Self {
             enigo,
             screen_size,
-            cursor_ema: None,
             virtual_input,
-            click_ready: true,
-            click_timer: Instant::now(),
-            last_volume_flip: Instant::now(),
-            palm_positions: Vec::with_capacity(10),
-            palm_times: Vec::with_capacity(10),
-            last_fist: Instant::now(),
-
-            tilt_armed: true,
+            dry_run,
+            debug,
+            mode: Mode::Idle,
+            last_status: String::new(),
+            cursor_ema: None,
+            pinch_left_armed: true,
+            pinch_right_armed: true,
+            last_click: Instant::now(),
+            hist: VecDeque::with_capacity(64),
+            scroll_entered: None,
+            scroll_last_y: None,
+            scroll_acc: 0.0,
+            fist_since: None,
+            fist_fired: false,
+            last_fist_fire: Instant::now(),
             tilt_ema: None,
+            tilt_armed: true,
+            vol_armed: true,
             last_workspace_switch: Instant::now(),
-            last_two_finger_y: None,
-
+            last_volume_flip: Instant::now(),
             clap_count: 0,
             last_clap_time: Instant::now(),
             clap_together: false,
             shutdown_window_until: None,
             right_hand_start_y: None,
             last_shutdown: None,
-
-            dry_run,
-            debug,
         })
     }
 
-    fn process(
-        &mut self,
-        lm: &[[f32; 3]],
-    ) -> Result<()> {
+    fn status(&mut self, s: &str) {
+        if self.last_status != s {
+            self.last_status = s.to_string();
+            println!("{s}");
+        }
+    }
+
+    /// Called on frames where no usable hand is present.
+    fn on_hand_lost(&mut self) {
+        self.cursor_ema = None;
+        self.hist.clear();
+        self.tilt_ema = None;
+        self.tilt_armed = true;
+        self.vol_armed = true;
+        self.scroll_last_y = None;
+        self.scroll_acc = 0.0;
+        self.fist_since = None;
+        self.set_mode(Mode::Idle);
+    }
+
+    fn set_mode(&mut self, m: Mode) {
+        if self.mode != m {
+            self.mode = m;
+            match m {
+                Mode::Cursor => self.cursor_ema = None, // snap on entry, no glide
+                Mode::Scroll => self.scroll_entered = Some(Instant::now()),
+                _ => {}
+            }
+            self.status(&format!("[MODE] {}", m.label()));
+        }
+    }
+
+    fn process(&mut self, lm: &[[f32; 3]]) -> Result<()> {
         let span = hand_span(lm);
         if span < MIN_HAND_SPAN {
-            // Ignore spurious/tiny detections that are not a real hand.
             return Ok(());
         }
 
-        let fingers = fingers_up(lm);
         let now = Instant::now();
-        let palm = dist(&lm[0], &lm[9]);
+        let fingers = fingers_up(lm);
+        let four = [fingers[1], fingers[2], fingers[3], fingers[4]];
+        let ext_count = four.iter().filter(|&&x| x).count();
+        let fist_now = ext_count == 0 && lm[0][1] < FIST_MAX_WRIST_Y;
+        let palm_size = dist(&lm[0], &lm[9]);
+
         if self.debug {
             eprintln!(
-                "[STATE] span={:.3} palm={:.3} fingers={:?} open={} fist={} pointing={}",
-                span,
-                palm,
-                fingers,
-                is_open_hand(&fingers),
-                is_fist(&fingers),
-                is_index_pointing(&fingers)
+                "[STATE] span={span:.3} palm={palm_size:.3} fingers={fingers:?} mode={:?}",
+                self.mode
             );
         }
 
-        // Pinch clicks (thumb + index / thumb + middle) work regardless of
-        // whether the hand is classified as open, so they can be used while
-        // pointing or with an open palm.
-        let d_left = dist(&lm[4], &lm[8]);
-        let d_right = dist(&lm[4], &lm[12]);
-        if self.click_ready {
-            if d_left < CLICK_THRESHOLD && d_left < palm * CLICK_THRESHOLD_REL {
-                self.do_click(Button::Left, "left click", now)?;
-            } else if d_right < CLICK_THRESHOLD && d_right < palm * CLICK_THRESHOLD_REL {
-                self.do_click(Button::Right, "right click", now)?;
+        // Motion history for velocity estimates (rolling ~350ms window).
+        self.hist.push_back(Sample { t: now, p: palm_centroid(lm) });
+        while let Some(s) = self.hist.front() {
+            if now.duration_since(s.t) > Duration::from_millis(350) {
+                self.hist.pop_front();
+            } else {
+                break;
+            }
+        }
+        let (vx, vy) = self.velocity();
+
+        // ---- Fist: hold-to-confirm, single shot --------------------------
+        if fist_now {
+            match self.fist_since {
+                None => self.fist_since = Some(now),
+                Some(t0) => {
+                    if !self.fist_fired && now.duration_since(t0) >= FIST_HOLD {
+                        self.close_tab()?;
+                        self.fist_fired = true;
+                        self.last_fist_fire = now;
+                    }
+                }
+            }
+        } else {
+            self.fist_since = None;
+            if self.fist_fired && now.duration_since(self.last_fist_fire) > FIST_REARM {
+                self.fist_fired = false;
             }
         }
 
-        if !self.click_ready && now.duration_since(self.click_timer) > CLICK_COOLDOWN {
-            self.click_ready = true;
+        // ---- Pinch clicks (suppressed while the hand is closing) ---------
+        if !fist_now {
+            let d_left = dist(&lm[4], &lm[8]);
+            let d_right = dist(&lm[4], &lm[12]);
+            let rel = palm_size * PINCH_PALM_REL;
+            let can_click = now.duration_since(self.last_click) > CLICK_COOLDOWN;
+
+            // The triggering finger must be extended, otherwise a curled
+            // resting hand brings tips close together and fires phantom
+            // clicks.
+            if self.pinch_left_armed && can_click && fingers[1] && d_left < PINCH_ON.min(rel) {
+                self.do_click(Button::Left, "left click", now)?;
+                self.pinch_left_armed = false;
+            } else if d_left > PINCH_OFF {
+                self.pinch_left_armed = true;
+            }
+
+            if self.pinch_right_armed && can_click && fingers[2] && d_right < PINCH_ON.min(rel) {
+                self.do_click(Button::Right, "right click", now)?;
+                self.pinch_right_armed = false;
+            } else if d_right > PINCH_OFF {
+                self.pinch_right_armed = true;
+            }
         }
 
-        // Volume is handled by vertical flips in detect_swipe_or_fist().
-
-        // Cursor: point index finger (an open palm is reserved for swipes/volume flips).
-        if is_two_fingers(&fingers) {
-            self.handle_scroll(lm)?;
+        // ---- Mode selection ---------------------------------------------
+        let new_mode = if fist_now || self.fist_fired {
+            Mode::Idle
+        } else if fingers[1] && fingers[2] && !fingers[3] && !fingers[4] {
+            Mode::Scroll
+        } else if fingers[1] && ext_count == 1 {
+            Mode::Cursor
+        } else if ext_count >= 3 {
+            Mode::Palm
         } else {
-            self.last_two_finger_y = None;
-        }
+            Mode::Idle
+        };
+        self.set_mode(new_mode);
 
-        if is_index_pointing(&fingers) && !is_two_fingers(&fingers) {
-            self.move_cursor(lm)?;
+        match self.mode {
+            Mode::Scroll => self.handle_scroll(lm, now)?,
+            Mode::Cursor => self.move_cursor(lm)?,
+            Mode::Palm => self.handle_palm(lm, vx, vy, now)?,
+            Mode::Idle => {
+                self.scroll_acc = 0.0;
+                self.scroll_last_y = None;
+                self.tilt_ema = None;
+            }
         }
-
-        // Swipes / fist
-        self.detect_swipe_or_fist(lm, now)?;
 
         Ok(())
+    }
+
+    /// Mean velocity over the history window (normalized units / second).
+    fn velocity(&self) -> (f32, f32) {
+        if self.hist.len() < 2 {
+            return (0.0, 0.0);
+        }
+        let first = self.hist.front().unwrap();
+        let last = self.hist.back().unwrap();
+        let dt = last.t.duration_since(first.t).as_secs_f32();
+        if dt < 0.05 {
+            return (0.0, 0.0);
+        }
+        (
+            (last.p[0] - first.p[0]) / dt,
+            (last.p[1] - first.p[1]) / dt,
+        )
     }
 
     fn do_click(&mut self, button: Button, name: &str, now: Instant) -> Result<()> {
         if self.dry_run {
-            println!("[GESTURE] {}", name);
+            println!("[GESTURE] {name}");
         } else {
             self.button_click(button)
-                .with_context(|| format!("{} failed", name))?;
+                .with_context(|| format!("{name} failed"))?;
         }
-        self.click_ready = false;
-        self.click_timer = now;
+        self.last_click = now;
         Ok(())
     }
 
-    fn handle_scroll(&mut self, lm: &[[f32; 3]]) -> Result<()> {
-        // Average Y position of index and middle finger tips
-        let current_y = (lm[8][1] + lm[12][1]) / 2.0;
-
-        if let Some(last_y) = self.last_two_finger_y {
-            let dy = current_y - last_y;
-            // Scroll threshold and multiplier
-            let scroll_threshold = 0.02; 
-            if dy.abs() > scroll_threshold {
-                let scroll_amount = if dy > 0.0 { -1 } else { 1 }; // Invert for natural scrolling
-                if !self.dry_run {
-                    self.scroll_mouse(scroll_amount)?;
-                } else {
-                    println!("[GESTURE] scroll {}", scroll_amount);
-                }
-                // Only update last_y when a scroll is triggered to accumulate small movements
-                self.last_two_finger_y = Some(current_y);
-            }
-        } else {
-            self.last_two_finger_y = Some(current_y);
+    fn handle_scroll(&mut self, lm: &[[f32; 3]], now: Instant) -> Result<()> {
+        // Wait for the gesture to settle so pointing->scroll transitions
+        // don't emit phantom ticks.
+        if now.duration_since(self.scroll_entered.unwrap_or(now)) < SCROLL_SETTLE {
+            self.scroll_last_y = Some((lm[8][1] + lm[12][1]) / 2.0);
+            return Ok(());
         }
 
+        let current_y = (lm[8][1] + lm[12][1]) / 2.0;
+        if let Some(last_y) = self.scroll_last_y {
+            self.scroll_acc += current_y - last_y;
+        }
+        self.scroll_last_y = Some(current_y);
+
+        let mut ticks = 0;
+        while self.scroll_acc.abs() >= SCROLL_TICK && ticks < SCROLL_MAX_TICKS {
+            // Fingers move down -> page scrolls down (standard mouse feel).
+            let dir = if self.scroll_acc > 0.0 { -1 } else { 1 };
+            if !self.dry_run {
+                self.scroll_mouse(dir)?;
+            } else {
+                println!("[GESTURE] scroll {}", if dir < 0 { "down" } else { "up" });
+            }
+            self.scroll_acc -= SCROLL_TICK * self.scroll_acc.signum();
+            ticks += 1;
+        }
         Ok(())
     }
 
     fn move_cursor(&mut self, lm: &[[f32; 3]]) -> Result<()> {
         let tip = lm[8];
-        let (rx_min, ry_min, rx_max, ry_max) = MOUSE_REGION;
+        let raw_x = ((tip[0] - MARGIN) / (1.0 - 2.0 * MARGIN)).clamp(0.0, 1.0);
+        let raw_y = ((tip[1] - MARGIN) / (1.0 - 2.0 * MARGIN)).clamp(0.0, 1.0);
+        let raw = [raw_x * self.screen_size.0 as f32, raw_y * self.screen_size.1 as f32];
 
-        let dx = ((tip[0] - rx_min) / (rx_max - rx_min)).clamp(0.0, 1.0);
-        let dy = ((tip[1] - ry_min) / (ry_max - ry_min)).clamp(0.0, 1.0);
-
-        // Amplify movement around the center to make the cursor more sensitive.
-        let dx = ((dx - 0.5) * CURSOR_GAIN + 0.5).clamp(0.0, 1.0);
-        let dy = ((dy - 0.5) * CURSOR_GAIN + 0.5).clamp(0.0, 1.0);
-
-        let raw_x = dx * self.screen_size.0 as f32;
-        let raw_y = dy * self.screen_size.1 as f32;
-
-        let (smooth_x, smooth_y) = match self.cursor_ema {
-            Some([ex, ey]) => {
-                let dx = (raw_x - ex).abs();
-                let dy = (raw_y - ey).abs();
-                if dx < CURSOR_MIN_MOVE_PX && dy < CURSOR_MIN_MOVE_PX {
-                    // Ignore tiny movements from hand shake.
-                    (ex, ey)
+        let smoothed = match self.cursor_ema {
+            None => raw, // first frame: snap directly to the hand
+            Some(e) => {
+                let dpx = dist2d(&e, &raw);
+                if dpx < CURSOR_JITTER_PX {
+                    e // hold still against micro-shake
                 } else {
-                    // Low-pass exponential moving average.
-                    (
-                        CURSOR_ALPHA * raw_x + (1.0 - CURSOR_ALPHA) * ex,
-                        CURSOR_ALPHA * raw_y + (1.0 - CURSOR_ALPHA) * ey,
-                    )
+                    // Adaptive smoothing: slow hand = heavy smoothing (stable),
+                    // fast hand = near-instant tracking (responsive).
+                    let alpha = (SMOOTH_MIN + (SMOOTH_MAX - SMOOTH_MIN) * (dpx / SMOOTH_RANGE_PX).min(1.0)).min(SMOOTH_MAX);
+                    [e[0] + alpha * (raw[0] - e[0]), e[1] + alpha * (raw[1] - e[1])]
                 }
             }
-            None => (raw_x, raw_y),
         };
 
-        self.cursor_ema = Some([smooth_x, smooth_y]);
-        let avg_x = smooth_x as i32;
-        let avg_y = smooth_y as i32;
+        self.cursor_ema = Some(smoothed);
+        let x = smoothed[0] as i32;
+        let y = smoothed[1] as i32;
 
         if self.debug {
-            eprintln!("[CURSOR] target={:.3},{:.3} screen={}x{}", tip[0], tip[1], avg_x, avg_y);
+            eprintln!("[CURSOR] target=({:.3},{:.3}) screen=({}, {})", tip[0], tip[1], x, y);
         }
         if !self.dry_run {
-            self.move_mouse(avg_x, avg_y)?;
+            self.move_mouse(x, y)?;
         }
         Ok(())
     }
 
-    fn detect_swipe_or_fist(&mut self, lm: &[[f32; 3]], now: Instant) -> Result<()> {
-        let fingers = fingers_up(lm);
-        let c = palm_centroid(lm);
-        self.palm_positions.push(c);
-        self.palm_times.push(now);
-        if self.palm_positions.len() > 10 {
-            self.palm_positions.remove(0);
-            self.palm_times.remove(0);
-        }
-
-        if is_fist(&fingers) && now.duration_since(self.last_fist) > FIST_COOLDOWN {
-            if self.dry_run {
-                println!("[GESTURE] close tab");
-            } else {
-                // Ctrl+W
-                self.key_combo(&[EvKey::KEY_LEFTCTRL], EvKey::KEY_W)?;
-            }
-            self.last_fist = now;
-            self.palm_positions.clear();
-            self.palm_times.clear();
-            return Ok(());
-        }
-
-        if self.palm_positions.len() < 3 {
-            return Ok(());
-        }
-
-        let xs: Vec<f32> = self.palm_positions.iter().map(|p| p[0]).collect();
-        let ys: Vec<f32> = self.palm_positions.iter().map(|p| p[1]).collect();
-        let dt = self.palm_times.last().unwrap().duration_since(self.palm_times[0]).as_secs_f32();
-        if dt == 0.0 {
-            return Ok(());
-        }
-        let vx = (xs.last().unwrap() - xs.first().unwrap()) / dt;
-        let vy = (ys.last().unwrap() - ys.first().unwrap()) / dt;
-
-        // Tilt-wave -> workspace switch. Gate is deliberately loose: during a
-        // fast wave, motion blur makes MediaPipe drop fingers, so requiring
-        // all four extended misses most attempts. Edge-triggered: fires when
-        // the smoothed tilt passes TILT_FIRE_DEG, re-arms below TILT_ARM_DEG.
-        let ext = fingers[1] as i32 + fingers[2] as i32 + fingers[3] as i32 + fingers[4] as i32;
-        if !is_fist(&fingers) && ext >= 2 {
+    /// Open palm: horizontal tilt-wave switches workspace, vertical flip
+    /// steps volume. Both require real velocity along their axis.
+    fn handle_palm(
+        &mut self,
+        lm: &[[f32; 3]],
+        vx: f32,
+        vy: f32,
+        now: Instant,
+    ) -> Result<()> {
+        // --- Workspace via tilt-wave ---
+        let waving = vx.abs() > WAVE_VEL && vx.abs() > DOMINANCE * vy.abs();
+        if waving {
             let raw = hand_tilt_deg(lm);
-            // Smooth to reject landmark jitter on the short wrist->knuckle vector.
             let smooth = match self.tilt_ema {
                 Some(t) => t + TILT_ALPHA * (raw - t),
                 None => raw,
@@ -428,68 +524,66 @@ impl Controller {
 
             if self.debug {
                 eprintln!(
-                    "[TILT] raw={raw:+.1} smooth={smooth:+.1} (fire ±{TILT_FIRE_DEG}, armed={})",
+                    "[TILT] raw={raw:+.1} smooth={smooth:+.1} vx={vx:+.2} armed={}",
                     self.tilt_armed
                 );
             }
 
-            if !self.tilt_armed {
-                if smooth.abs() < TILT_ARM_DEG {
-                    self.tilt_armed = true;
-                }
-            } else if smooth.abs() >= TILT_FIRE_DEG
+            if self.tilt_armed
+                && smooth.abs() >= TILT_FIRE_DEG
                 && now.duration_since(self.last_workspace_switch) > WORKSPACE_COOLDOWN
             {
-                // Tilt right -> previous workspace, tilt left -> next.
-                self.switch_workspace(if smooth > 0.0 { "left" } else { "right" })?;
+                // Lean the hand toward your right -> workspace to the right.
+                let dir = if smooth > 0.0 { "right" } else { "left" };
+                self.switch_workspace(dir)?;
                 self.last_workspace_switch = now;
                 self.tilt_armed = false;
             }
         } else {
-            // Hand closed or gone: reset smoothing for the next wave.
-            self.tilt_ema = None;
+            // Not waving: re-arm once the hand settles back near vertical.
+            if self.tilt_ema.map(|t| t.abs()).unwrap_or(0.0) < TILT_ARM_DEG {
+                self.tilt_armed = true;
+            }
+            if self.tilt_armed {
+                self.tilt_ema = None;
+            }
         }
 
-        // Vertical flip -> volume step. Requires a clearly open hand and
-        // predominantly vertical motion so it does not steal tilt-waves.
-        if is_swipe_hand(&fingers)
+        // --- Volume via vertical flip ---
+        let flipping = vy.abs() > FLIP_VEL && vy.abs() > DOMINANCE * vx.abs();
+        if flipping && self.vol_armed
             && now.duration_since(self.last_volume_flip) > VOLUME_FLIP_COOLDOWN
-            && vy.abs() > vx.abs()
         {
-            if vy < -FLIP_VEL {
-                self.volume_flip(true)?; // flip up -> volume up
-                self.last_volume_flip = now;
-                self.palm_positions.clear();
-                self.palm_times.clear();
-                return Ok(());
-            } else if vy > FLIP_VEL {
-                self.volume_flip(false)?; // flip down -> volume down
-                self.last_volume_flip = now;
-                self.palm_positions.clear();
-                self.palm_times.clear();
-                return Ok(());
+            let up = vy < 0.0; // flip up -> volume up
+            if self.dry_run {
+                println!("[GESTURE] volume {}", if up { "up" } else { "down" });
+            } else {
+                adjust_volume(up, VOLUME_STEP)?;
             }
+            self.last_volume_flip = now;
+            self.vol_armed = false;
+            self.hist.clear(); // restart velocity window cleanly
+        } else if !flipping && vy.abs() < FLIP_VEL * 0.5 {
+            self.vol_armed = true;
         }
 
         Ok(())
     }
 
-    fn volume_flip(&mut self, up: bool) -> Result<()> {
+    fn close_tab(&mut self) -> Result<()> {
         if self.dry_run {
-            println!("[GESTURE] volume {}", if up { "up" } else { "down" });
+            println!("[GESTURE] close tab");
             return Ok(());
         }
-        adjust_volume(up, VOLUME_STEP)
+        self.key_combo(&[EvKey::KEY_LEFTCTRL], EvKey::KEY_W)
     }
 
     fn switch_workspace(&mut self, direction: &str) -> Result<()> {
         if self.dry_run {
-            println!("[GESTURE] switch workspace {}", direction);
+            println!("[GESTURE] switch workspace {direction}");
             return Ok(());
         }
 
-        // Hyprland does not bind Ctrl+Alt+arrows by default, so talk to it
-        // directly instead of injecting keys.
         if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() && command_exists("hyprctl") {
             let delta = if direction == "left" { "e-1" } else { "e+1" };
             return Command::new("hyprctl")
@@ -507,25 +601,12 @@ impl Controller {
             return vi.key_combo(&[EvKey::KEY_LEFTCTRL, EvKey::KEY_LEFTALT], key);
         }
 
-        // Fallback to compositor/desktop-specific commands.
         if command_exists("hyprctl") {
             let delta = if direction == "left" { "-1" } else { "+1" };
             return Command::new("hyprctl")
                 .args(["dispatch", "workspace", delta])
                 .status()
                 .context("hyprctl failed")
-                .map(|_| ());
-        }
-        if command_exists("swaymsg") {
-            let cmd = if direction == "left" {
-                "workspace prev_on_output"
-            } else {
-                "workspace next_on_output"
-            };
-            return Command::new("swaymsg")
-                .args([cmd])
-                .status()
-                .context("swaymsg failed")
                 .map(|_| ());
         }
         if command_exists("xdotool") {
@@ -536,7 +617,7 @@ impl Controller {
                 .context("xdotool failed")
                 .map(|_| ());
         }
-        anyhow::bail!("no workspace-switching backend found (tried uinput, hyprctl, swaymsg and xdotool)");
+        anyhow::bail!("no workspace-switching backend found (tried uinput, hyprctl and xdotool)");
     }
 
     fn check_shutdown_gesture(&mut self, hands: &[Hand]) -> Result<()> {
@@ -545,7 +626,6 @@ impl Controller {
             return Ok(());
         }
 
-        // Reset clap count if the window is closed and too much time passed.
         if self.shutdown_window_until.is_none()
             && self.clap_count > 0
             && now.duration_since(self.last_clap_time) > CLAP_TIMEOUT
@@ -553,14 +633,12 @@ impl Controller {
             self.clap_count = 0;
         }
 
-        // Expire the shutdown window.
         if let Some(until) = self.shutdown_window_until {
             if now > until {
                 self.shutdown_window_until = None;
                 self.right_hand_start_y = None;
                 self.clap_count = 0;
             } else if self.right_hand_start_y.is_none() {
-                // Capture baseline right-hand wrist Y when the window opens.
                 if let Some(h) = hands.iter().find(|h| h.handedness.as_deref() == Some("Right")) {
                     self.right_hand_start_y = h.landmarks.first().map(|p| p[1]);
                 }
@@ -574,7 +652,6 @@ impl Controller {
             }
         }
 
-        // Count a fresh clap event.
         let clapping = self.hands_are_clapping(hands);
         if clapping && !self.clap_together && now.duration_since(self.last_clap_time) > CLAP_COOLDOWN
         {
@@ -591,26 +668,19 @@ impl Controller {
     }
 
     fn hands_are_clapping(&self, hands: &[Hand]) -> bool {
-        let valid: Vec<_> = hands
-            .iter()
-            .filter(|h| h.landmarks.len() >= 21)
-            .collect();
+        let valid: Vec<_> = hands.iter().filter(|h| h.landmarks.len() >= 21).collect();
         if valid.len() < 2 {
             return false;
         }
         let w1 = &valid[0].landmarks[0];
         let w2 = &valid[1].landmarks[0];
-        let d = dist(w1, w2);
-        d < CLAP_THRESHOLD
+        dist(w1, w2) < CLAP_THRESHOLD
     }
 
     fn trigger_shutdown(&mut self) -> Result<()> {
         if self.dry_run {
             println!("[GESTURE] shutdown (dry-run, not executing)");
-            self.last_shutdown = Some(Instant::now());
-            self.shutdown_window_until = None;
-            self.right_hand_start_y = None;
-            self.clap_count = 0;
+            self.reset_shutdown_state(Instant::now());
             return Ok(());
         }
 
@@ -618,10 +688,7 @@ impl Controller {
         eprintln!("Powering off in 2 seconds... (Ctrl+C to cancel)");
         std::thread::sleep(Duration::from_secs(2));
 
-        self.last_shutdown = Some(Instant::now());
-        self.shutdown_window_until = None;
-        self.right_hand_start_y = None;
-        self.clap_count = 0;
+        self.reset_shutdown_state(Instant::now());
 
         if Command::new("systemctl").arg("poweroff").status().is_ok() {
             return Ok(());
@@ -635,13 +702,18 @@ impl Controller {
         anyhow::bail!("failed to shut down the system");
     }
 
+    fn reset_shutdown_state(&mut self, now: Instant) {
+        self.last_shutdown = Some(now);
+        self.shutdown_window_until = None;
+        self.right_hand_start_y = None;
+        self.clap_count = 0;
+    }
+
     fn move_mouse(&mut self, x: i32, y: i32) -> Result<()> {
         if let Some(vi) = &mut self.virtual_input {
             vi.move_mouse(x, y)
         } else {
-            self.enigo
-                .move_mouse(x, y, Coordinate::Abs)
-                .context("mouse move failed")
+            self.enigo.move_mouse(x, y, Coordinate::Abs).context("mouse move failed")
         }
     }
 
@@ -649,9 +721,7 @@ impl Controller {
         if let Some(vi) = &mut self.virtual_input {
             vi.scroll(y)
         } else {
-            self.enigo
-                .scroll(y, Axis::Vertical)
-                .context("mouse scroll failed")
+            self.enigo.scroll(y, Axis::Vertical).context("mouse scroll failed")
         }
     }
 
@@ -659,9 +729,7 @@ impl Controller {
         if let Some(vi) = &mut self.virtual_input {
             vi.button_click(button)
         } else {
-            self.enigo
-                .button(button, Direction::Click)
-                .context("button click failed")
+            self.enigo.button(button, Direction::Click).context("button click failed")
         }
     }
 
@@ -671,15 +739,15 @@ impl Controller {
         } else {
             for m in modifiers {
                 let enigo_key = evdev_to_enigo_key(*m)
-                    .with_context(|| format!("unsupported modifier for Enigo fallback: {:?}", m))?;
+                    .with_context(|| format!("unsupported modifier for Enigo fallback: {m:?}"))?;
                 self.enigo.key(enigo_key, Direction::Press)?;
             }
             let enigo_key = evdev_to_enigo_key(key)
-                .with_context(|| format!("unsupported key for Enigo fallback: {:?}", key))?;
+                .with_context(|| format!("unsupported key for Enigo fallback: {key:?}"))?;
             self.enigo.key(enigo_key, Direction::Click)?;
             for m in modifiers.iter().rev() {
                 let enigo_key = evdev_to_enigo_key(*m)
-                    .with_context(|| format!("unsupported modifier for Enigo fallback: {:?}", m))?;
+                    .with_context(|| format!("unsupported modifier for Enigo fallback: {m:?}"))?;
                 self.enigo.key(enigo_key, Direction::Release)?;
             }
             Ok(())
@@ -714,6 +782,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let dry_run = args.iter().any(|a| a == "--dry-run");
     let debug = args.iter().any(|a| a == "--debug");
+    let preview = args.iter().any(|a| a == "--preview");
     let camera = args
         .iter()
         .position(|a| a == "--camera")
@@ -723,13 +792,16 @@ fn main() -> Result<()> {
 
     let python = std::env::var("AIR_MOUSE_PYTHON")
         .unwrap_or_else(|_| "/home/dranzer/hand-control/.venv/bin/python".into());
-    let mut child = Command::new(python)
-        .arg("tracker.py")
+
+    let mut cmd = Command::new(python);
+    cmd.arg("tracker.py")
         .arg("--camera")
         .arg(&camera)
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("failed to start tracker.py")?;
+        .stdout(Stdio::piped());
+    if preview {
+        cmd.arg("--preview");
+    }
+    let mut child = cmd.spawn().context("failed to start tracker.py")?;
 
     let stdout = child.stdout.take().context("no stdout")?;
     let reader = BufReader::new(stdout);
@@ -751,24 +823,116 @@ fn main() -> Result<()> {
             eprintln!("shutdown gesture error: {e:?}");
         }
 
-        // Use the right hand for normal control if available, otherwise any detected hand.
-        // Pause normal gestures while the shutdown sequence is waiting for the hand drop.
-        if ctrl.shutdown_window_until.is_none() {
-            let primary = frame
-                .hands
-                .iter()
-                .find(|h| h.handedness.as_deref() == Some("Right"))
-                .or_else(|| frame.hands.first());
+        if ctrl.shutdown_window_until.is_some() {
+            continue;
+        }
 
-            if let Some(hand) = primary {
-                let lm = &hand.landmarks;
-                if lm.len() >= 21 && let Err(e) = ctrl.process(lm) {
+        // Prefer the right hand; fall back to any detected hand.
+        let primary = frame
+            .hands
+            .iter()
+            .find(|h| h.handedness.as_deref() == Some("Right"))
+            .or_else(|| frame.hands.first());
+
+        match primary {
+            Some(hand) if hand.landmarks.len() >= 21 => {
+                if let Err(e) = ctrl.process(&hand.landmarks) {
                     eprintln!("process error: {e:?}");
                 }
             }
+            _ => ctrl.on_hand_lost(),
         }
     }
 
     let _ = child.kill();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Open palm: wrist at bottom, fingers straight up.
+    fn open_palm() -> [[f32; 3]; 21] {
+        let mut lm = [[0.0; 3]; 21];
+        lm[0] = [0.50, 0.90, 0.0];
+        // thumb (extended to the left)
+        lm[1] = [0.44, 0.84, 0.0];
+        lm[2] = [0.40, 0.78, 0.0];
+        lm[3] = [0.37, 0.72, 0.0];
+        lm[4] = [0.34, 0.66, 0.0];
+        // index / middle / ring / pinky: mcp, pip, dip, tip straight up
+        for (col, base) in [(0usize, 5usize), (1, 9), (2, 13), (3, 17)] {
+            let x = 0.44 + col as f32 * 0.055;
+            let y_top = 0.70 - col as f32 * 0.02;
+            lm[base] = [x, y_top + 0.00, 0.0];
+            lm[base + 1] = [x, y_top - 0.08, 0.0];
+            lm[base + 2] = [x, y_top - 0.14, 0.0];
+            lm[base + 3] = [x, y_top - 0.20, 0.0];
+        }
+        lm
+    }
+
+    fn curl(lm: &mut [[f32; 3]; 21], base: usize) {
+        // Fold pip/dip/tip back down toward the palm.
+        let x = lm[base][0];
+        let y = lm[base][1];
+        lm[base + 1] = [x, y - 0.02, 0.0];
+        lm[base + 2] = [x + 0.02, y + 0.02, 0.0];
+        lm[base + 3] = [x + 0.04, y + 0.04, 0.0];
+    }
+
+    #[test]
+    fn open_hand_all_extended() {
+        assert!(fingers_up(&open_palm()).iter().all(|&x| x));
+    }
+
+    #[test]
+    fn fist_all_curled() {
+        let mut lm = open_palm();
+        // Thumb hooked back across the palm (tip curls toward the wrist).
+        lm[3] = [0.38, 0.74, 0.0];
+        lm[4] = [0.42, 0.79, 0.0];
+        for b in [5, 9, 13, 17] {
+            curl(&mut lm, b);
+        }
+        let f = fingers_up(&lm);
+        assert!(f.iter().all(|&x| !x), "fist misread as {f:?}");
+    }
+
+    #[test]
+    fn pointing_only_index() {
+        let mut lm = open_palm();
+        curl(&mut lm, 1);
+        for b in [9, 13, 17] {
+            curl(&mut lm, b);
+        }
+        let f = fingers_up(&lm);
+        assert_eq!((f[1], f[2], f[3], f[4]), (true, false, false, false));
+    }
+
+    #[test]
+    fn cursor_mapping_full_frame() {
+        let norm = |v: f32| ((v - MARGIN) / (1.0 - 2.0 * MARGIN)).clamp(0.0, 1.0);
+        assert_eq!(norm(MARGIN), 0.0);
+        assert_eq!(norm(1.0 - MARGIN), 1.0);
+        assert!((norm(0.5) - 0.5).abs() < 1e-6);
+        // A hand low in frame (resting position) is still reachable.
+        assert!(norm(0.85) > 0.85);
+    }
+
+    #[test]
+    fn tilt_sign_uses_knuckle_direction() {
+        let mut lm = open_palm();
+        // Shift knuckles right of the wrist -> fingers lean right -> positive.
+        for i in 1..21 {
+            lm[i][0] += 0.15;
+        }
+        assert!(hand_tilt_deg(&lm) > 10.0);
+        let mut lm2 = open_palm();
+        for i in 1..21 {
+            lm2[i][0] -= 0.15;
+        }
+        assert!(hand_tilt_deg(&lm2) < -10.0);
+    }
 }

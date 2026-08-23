@@ -18,6 +18,20 @@ from mediapipe.tasks.python.vision.hand_landmarker import HandLandmarker, HandLa
 from mediapipe.tasks.python.vision.core.vision_task_running_mode import VisionTaskRunningMode as RunningMode
 
 
+def open_camera(pref: int) -> cv2.VideoCapture:
+    # Try the requested index first, then scan a few common ones.
+    for idx in [pref, *range(0, 5)]:
+        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        if cap.isOpened():
+            ok, _ = cap.read()
+            if ok:
+                if idx != pref:
+                    print(f"camera {pref} unavailable, using camera {idx}", file=sys.stderr)
+                return cap
+        cap.release()
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--camera", type=int, default=0)
@@ -39,32 +53,35 @@ def main():
         base_options=BaseOptions(model_asset_path=model_path),
         running_mode=RunningMode.VIDEO,
         num_hands=2,
-        min_hand_detection_confidence=0.5,
-        min_hand_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
+        min_hand_detection_confidence=0.4,
+        min_hand_presence_confidence=0.4,
+        min_tracking_confidence=0.4,
     )
     detector = HandLandmarker.create_from_options(options)
 
-    cap = cv2.VideoCapture(args.camera)
-    if not cap.isOpened():
-        print(f"ERROR: cannot open camera {args.camera}", file=sys.stderr)
+    cap = open_camera(args.camera)
+    if cap is None:
+        print("ERROR: no working camera found", file=sys.stderr)
         sys.exit(1)
 
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # always analyze the freshest frame
 
-    start_time = time.time()
+    start_time = time.monotonic()
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
+                time.sleep(0.005)  # don't burn CPU if the camera hiccups
                 continue
 
             frame = cv2.flip(frame, 1)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            timestamp_ms = int((time.time() - start_time) * 1000)
+            timestamp_ms = int((time.monotonic() - start_time) * 1000)
             result = detector.detect_for_video(mp_image, timestamp_ms)
 
             hands = []
