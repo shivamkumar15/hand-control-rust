@@ -52,8 +52,22 @@ const VOLUME_STEP: u32 = 5;
 // opens again. Transitions through a half-closed hand never close tabs.
 const FIST_HOLD: Duration = Duration::from_millis(400);
 const FIST_REARM: Duration = Duration::from_millis(400);
-const FINGER_STRAIGHT_DEG: f32 = 145.0; // joint angle above this = extended
 const FIST_MAX_WRIST_Y: f32 = 0.60; // fist must be raised; low/resting hands never fire
+
+// Finger extension uses hysteresis: the angle must rise above FINGER_UP_DEG to
+// count as extended, then fall below FINGER_DOWN_DEG to count as folded. In
+// between, the previous state is kept, so borderline fingers stop flickering.
+const FINGER_UP_DEG: f32 = 140.0;
+const FINGER_DOWN_DEG: f32 = 122.0;
+
+// A candidate mode must be seen this many consecutive frames before it
+// replaces the current one. Kills single-frame misreads that used to fire
+// stray volume flips / workspace switches.
+const MODE_CONFIRM_FRAMES: u32 = 3;
+
+// After the palm gesture engages, wait this long before waves/flips can fire,
+// so leftover velocity from pointing doesn't trigger them instantly.
+const PALM_SETTLE: Duration = Duration::from_millis(200);
 
 const CLAP_THRESHOLD: f32 = 0.12;
 const CLAP_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -102,31 +116,42 @@ fn hand_span(lm: &[[f32; 3]]) -> f32 {
 }
 
 /// Angle at joint `b` of the triangle a-b-c, in degrees. Straight = ~180.
+/// Uses all three coordinates, so a finger pointing toward the camera
+/// (foreshortened in 2D) is still measured correctly.
 fn joint_angle(a: &[f32; 3], b: &[f32; 3], c: &[f32; 3]) -> f32 {
-    let v1 = [a[0] - b[0], a[1] - b[1]];
-    let v2 = [c[0] - b[0], c[1] - b[1]];
-    let m1 = (v1[0] * v1[0] + v1[1] * v1[1]).sqrt();
-    let m2 = (v2[0] * v2[0] + v2[1] * v2[1]).sqrt();
+    let v1 = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let v2 = [c[0] - b[0], c[1] - b[1], c[2] - b[2]];
+    let m1 = (v1[0] * v1[0] + v1[1] * v1[1] + v1[2] * v1[2]).sqrt();
+    let m2 = (v2[0] * v2[0] + v2[1] * v2[1] + v2[2] * v2[2]).sqrt();
     if m1 < 1e-6 || m2 < 1e-6 {
         return 180.0;
     }
-    ((v1[0] * v2[0] + v1[1] * v2[1]) / (m1 * m2))
+    ((v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2]) / (m1 * m2))
         .clamp(-1.0, 1.0)
         .acos()
         .to_degrees()
 }
 
-/// A finger is extended when its PIP joint is straight. Unlike tip-vs-wrist
-/// distance this is orientation-independent and correctly reports FOLDED for
-/// a thumb tucked into a fist.
-fn fingers_up(lm: &[[f32; 3]]) -> [bool; 5] {
+/// PIP joint angle of each finger (thumb first), in degrees.
+fn finger_angles(lm: &[[f32; 3]]) -> [f32; 5] {
     [
-        joint_angle(&lm[2], &lm[3], &lm[4]) > FINGER_STRAIGHT_DEG, // thumb
-        joint_angle(&lm[5], &lm[6], &lm[8]) > FINGER_STRAIGHT_DEG, // index
-        joint_angle(&lm[9], &lm[10], &lm[12]) > FINGER_STRAIGHT_DEG, // middle
-        joint_angle(&lm[13], &lm[14], &lm[16]) > FINGER_STRAIGHT_DEG, // ring
-        joint_angle(&lm[17], &lm[18], &lm[20]) > FINGER_STRAIGHT_DEG, // pinky
+        joint_angle(&lm[2], &lm[3], &lm[4]),   // thumb
+        joint_angle(&lm[5], &lm[6], &lm[8]),   // index
+        joint_angle(&lm[9], &lm[10], &lm[12]), // middle
+        joint_angle(&lm[13], &lm[14], &lm[16]), // ring
+        joint_angle(&lm[17], &lm[18], &lm[20]), // pinky
     ]
+}
+
+/// Hysteresis step for one finger's extended state.
+fn hysteresis_step(prev: bool, angle: f32) -> bool {
+    if angle >= FINGER_UP_DEG {
+        true
+    } else if angle <= FINGER_DOWN_DEG {
+        false
+    } else {
+        prev
+    }
 }
 
 fn palm_centroid(lm: &[[f32; 3]]) -> [f32; 2] {
@@ -192,6 +217,9 @@ struct Controller {
     debug: bool,
 
     mode: Mode,
+    mode_candidate: Option<Mode>,
+    cand_frames: u32,
+    finger_up: [bool; 5],
     last_status: String,
 
     cursor_ema: Option<[f32; 2]>,
@@ -213,6 +241,7 @@ struct Controller {
     tilt_ema: Option<f32>,
     tilt_armed: bool,
     vol_armed: bool,
+    palm_since: Option<Instant>,
     last_workspace_switch: Instant,
     last_volume_flip: Instant,
 
@@ -251,6 +280,9 @@ impl Controller {
             dry_run,
             debug,
             mode: Mode::Idle,
+            mode_candidate: None,
+            cand_frames: 0,
+            finger_up: [false; 5],
             last_status: String::new(),
             cursor_ema: None,
             pinch_left_armed: true,
@@ -266,6 +298,7 @@ impl Controller {
             tilt_ema: None,
             tilt_armed: true,
             vol_armed: true,
+            palm_since: None,
             last_workspace_switch: Instant::now(),
             last_volume_flip: Instant::now(),
             clap_count: 0,
@@ -294,6 +327,10 @@ impl Controller {
         self.scroll_last_y = None;
         self.scroll_acc = 0.0;
         self.fist_since = None;
+        self.finger_up = [false; 5];
+        self.mode_candidate = None;
+        self.cand_frames = 0;
+        self.palm_since = None;
         self.set_mode(Mode::Idle);
     }
 
@@ -303,10 +340,26 @@ impl Controller {
             match m {
                 Mode::Cursor => self.cursor_ema = None, // snap on entry, no glide
                 Mode::Scroll => self.scroll_entered = Some(Instant::now()),
+                // Restart motion history so pointing speed doesn't leak into
+                // palm gesture detection.
+                Mode::Palm => {
+                    self.palm_since = Some(Instant::now());
+                    self.hist.clear();
+                    self.tilt_ema = None;
+                }
                 _ => {}
             }
             self.status(&format!("[MODE] {}", m.label()));
         }
+    }
+
+    /// Update per-finger extended states with hysteresis.
+    fn update_fingers(&mut self, lm: &[[f32; 3]]) -> [bool; 5] {
+        let angles = finger_angles(lm);
+        for (i, &a) in angles.iter().enumerate() {
+            self.finger_up[i] = hysteresis_step(self.finger_up[i], a);
+        }
+        self.finger_up
     }
 
     fn process(&mut self, lm: &[[f32; 3]]) -> Result<()> {
@@ -316,7 +369,7 @@ impl Controller {
         }
 
         let now = Instant::now();
-        let fingers = fingers_up(lm);
+        let fingers = self.update_fingers(lm);
         let four = [fingers[1], fingers[2], fingers[3], fingers[4]];
         let ext_count = four.iter().filter(|&&x| x).count();
         let fist_now = ext_count == 0 && lm[0][1] < FIST_MAX_WRIST_Y;
@@ -384,7 +437,7 @@ impl Controller {
             }
         }
 
-        // ---- Mode selection ---------------------------------------------
+        // ---- Mode selection (debounced) ----------------------------------
         let new_mode = if fist_now || self.fist_fired {
             Mode::Idle
         } else if fingers[1] && fingers[2] && !fingers[3] && !fingers[4] {
@@ -396,7 +449,22 @@ impl Controller {
         } else {
             Mode::Idle
         };
-        self.set_mode(new_mode);
+        // The candidate must repeat for MODE_CONFIRM_FRAMES consecutive
+        // frames before it replaces the current mode.
+        if new_mode == self.mode {
+            self.mode_candidate = None;
+            self.cand_frames = 0;
+        } else if self.mode_candidate == Some(new_mode) {
+            self.cand_frames += 1;
+            if self.cand_frames >= MODE_CONFIRM_FRAMES {
+                self.set_mode(new_mode);
+                self.mode_candidate = None;
+                self.cand_frames = 0;
+            }
+        } else {
+            self.mode_candidate = Some(new_mode);
+            self.cand_frames = 1;
+        }
 
         match self.mode {
             Mode::Scroll => self.handle_scroll(lm, now)?,
@@ -512,6 +580,12 @@ impl Controller {
         vy: f32,
         now: Instant,
     ) -> Result<()> {
+        // Ignore the first moments of palm mode so residual motion from
+        // pointing can't fire workspace/volume gestures.
+        if now.duration_since(self.palm_since.unwrap_or(now)) < PALM_SETTLE {
+            return Ok(());
+        }
+
         // --- Workspace via tilt-wave ---
         let waving = vx.abs() > WAVE_VEL && vx.abs() > DOMINANCE * vy.abs();
         if waving {
@@ -882,6 +956,10 @@ mod tests {
         lm[base + 3] = [x + 0.04, y + 0.04, 0.0];
     }
 
+    fn fingers_up(lm: &[[f32; 3]]) -> [bool; 5] {
+        finger_angles(lm).map(|a| a > FINGER_UP_DEG)
+    }
+
     #[test]
     fn open_hand_all_extended() {
         assert!(fingers_up(&open_palm()).iter().all(|&x| x));
@@ -909,6 +987,35 @@ mod tests {
         }
         let f = fingers_up(&lm);
         assert_eq!((f[1], f[2], f[3], f[4]), (true, false, false, false));
+    }
+
+    #[test]
+    fn finger_toward_camera_still_reads_straight() {
+        // Index finger aimed at the camera: barely moves in x/y but gains
+        // depth. The old 2D-only angle read this as folded.
+        let mut lm = open_palm();
+        lm[5][2] = 0.00;
+        lm[6][2] = 0.05;
+        lm[7][2] = 0.10;
+        lm[8][2] = 0.15;
+        assert!(finger_angles(&lm)[1] > FINGER_UP_DEG);
+    }
+
+    #[test]
+    fn finger_hysteresis_holds_between_thresholds() {
+        let angles = [180.0, FINGER_UP_DEG + 1.0, 130.0, FINGER_DOWN_DEG - 1.0, 60.0];
+        let expected = [
+            true,  // straight -> up
+            true,  // above ON threshold -> up
+            true,  // inside band -> stays up (was up)
+            false, // below OFF threshold -> down
+            false, // curled -> down
+        ];
+        for (a, e) in angles.iter().zip(expected) {
+            assert_eq!(hysteresis_step(true, *a), e);
+        }
+        // Same band value keeps a previously-folded finger folded.
+        assert!(!hysteresis_step(false, 130.0));
     }
 
     #[test]

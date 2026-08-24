@@ -46,6 +46,8 @@ Press **Ctrl+C** to stop.
 - **Adaptive smoothing** — slow hand = stable cursor, fast hand = instant tracking. The cursor snaps (no glide) each time you start pointing.
 - **Safe fist** — only a *raised* fist held ~0.4 s closes a tab, once per gesture. A resting or transitioning hand can never fire it.
 - **No phantom clicks** — pinch needs the finger actually extended; a curled resting hand is inert.
+- **Hysteresis finger reading** — finger angles are measured in 3D and use two thresholds, so slightly bent fingers still register and borderline fingers never flicker between gestures.
+- **Debounced modes** — a pose must hold for 3 consecutive frames before the mode changes, and palm gestures wait ~200 ms after engaging, so stray poses mid-motion can't fire clicks, volume or workspace switches.
 - **Velocity-gated palm** — merely holding or rotating an open palm does nothing; you must genuinely wave (workspace) or flip (volume) along the matching axis.
 
 ## Tuning
@@ -63,6 +65,10 @@ All knobs are constants at the top of `src/main.rs`:
 | Volume flips too eager | raise `FLIP_VEL` |
 | Volume step size | `VOLUME_STEP` |
 | Fist too strict/loose | `FIST_HOLD`, `FIST_MAX_WRIST_Y` |
+| Gestures need perfectly straight fingers | lower `FINGER_UP_DEG` (and `FINGER_DOWN_DEG`) |
+| Finger states flicker between gestures | widen the `FINGER_UP_DEG` / `FINGER_DOWN_DEG` gap |
+| Modes react too slowly | lower `MODE_CONFIRM_FRAMES` |
+| Stray actions right after opening the palm | raise `PALM_SETTLE` |
 
 > **Warning:** The shutdown gesture is active in non-dry-run mode and calls `systemctl poweroff` with a 2-second delay. Make sure you can cancel it (`Ctrl+C` in the terminal) while testing.
 
