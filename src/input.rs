@@ -5,9 +5,6 @@ use evdev::{
     Key as EvKey, RelativeAxisType, Synchronization, UinputAbsSetup,
 };
 
-/// Native Linux virtual input device (uinput). Works on both X11 and Wayland,
-/// as long as the user has write access to `/dev/uinput` (usually via the
-/// `input` group).
 pub struct VirtualInput {
     device: evdev::uinput::VirtualDevice,
 }
