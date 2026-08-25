@@ -35,7 +35,7 @@ Press **Ctrl+C** to stop.
 | Pinch thumb + index | Left click |
 | Pinch thumb + middle | Right click |
 | Point index + middle, move up/down | Scroll (fingers down = page down) |
-| Open palm, wave/tilt left-right (like saying "no") | Switch workspace — lean right = next, left = previous |
+| Open palm, swipe left/right | Switch workspace — swipe right = next, left = previous |
 | Open palm, quick flip up / down | Volume up / down |
 | **Raised** closed fist, hold ~0.4 s | Close current tab (`Ctrl+W`) — fires once per fist |
 | Clap twice, then lower right hand | Shut down the system |
@@ -48,7 +48,8 @@ Press **Ctrl+C** to stop.
 - **No phantom clicks** — pinch needs the finger actually extended; a curled resting hand is inert.
 - **Hysteresis finger reading** — finger angles are measured in 3D and use two thresholds, so slightly bent fingers still register and borderline fingers never flicker between gestures.
 - **Debounced modes** — a pose must hold for 3 consecutive frames before the mode changes, and palm gestures wait ~200 ms after engaging, so stray poses mid-motion can't fire clicks, volume or workspace switches.
-- **Velocity-gated palm** — merely holding or rotating an open palm does nothing; you must genuinely wave (workspace) or flip (volume) along the matching axis.
+- **Displacement-based swipe** — workspace switching tracks how far your palm actually traveled, in the direction you swiped. Slow drift never fires, and the anchor decays when you stop, so stale distance can't fire later.
+- **Velocity-gated palm** — merely holding or rotating an open palm does nothing; you must genuinely swipe (workspace) or flip (volume) along the matching axis.
 
 ## Tuning
 
@@ -61,7 +62,9 @@ All knobs are constants at the top of `src/main.rs`:
 | Clicks fire too easily | raise `PINCH_ON` (and `PINCH_OFF`) |
 | Clicks hard to trigger | lower `PINCH_ON` |
 | Scroll too fine/coarse | `SCROLL_TICK` |
-| Workspace wave too eager | raise `WAVE_VEL` or `TILT_FIRE_DEG` |
+| Workspace swipe too eager | raise `SWIPE_DIST` or `SWIPE_VEL` |
+| Workspace swipe needs too much travel | lower `SWIPE_DIST` |
+| Gentle swipes ignored | lower `SWIPE_VEL` |
 | Volume flips too eager | raise `FLIP_VEL` |
 | Volume step size | `VOLUME_STEP` |
 | Fist too strict/loose | `FIST_HOLD`, `FIST_MAX_WRIST_Y` |
