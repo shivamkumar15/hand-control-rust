@@ -36,14 +36,18 @@ const SCROLL_TICK: f32 = 0.035; // fingertip travel per wheel tick (normalized)
 const SCROLL_SETTLE: Duration = Duration::from_millis(120);
 const SCROLL_MAX_TICKS: i32 = 3;
 
-// Open-palm gestures are velocity-gated so merely holding/rotating the hand
-// does nothing until you actually wave or flip it.
-const WAVE_VEL: f32 = 0.70; // normalized units / second
+// Open-palm gestures are motion-gated so merely holding/rotating the hand
+// does nothing until you actually swipe or flip it.
+//
+// Workspace: displacement-based swipe. The palm position is anchored when
+// palm mode settles; horizontal travel past SWIPE_DIST fires a switch in the
+// travel direction. Travel only accumulates while genuinely swiping, so slow
+// drift never fires, and the anchor eases back toward the hand when
+// stationary so stale distance can't fire later.
+const SWIPE_DIST: f32 = 0.18; // normalized units of travel per switch
+const SWIPE_VEL: f32 = 0.35; // min horizontal speed for travel to count
 const FLIP_VEL: f32 = 0.85;
 const DOMINANCE: f32 = 1.3; // axis must beat the other by this factor
-const TILT_FIRE_DEG: f32 = 24.0;
-const TILT_ARM_DEG: f32 = 14.0;
-const TILT_ALPHA: f32 = 0.45;
 const WORKSPACE_COOLDOWN: Duration = Duration::from_millis(400);
 const VOLUME_FLIP_COOLDOWN: Duration = Duration::from_millis(500);
 const VOLUME_STEP: u32 = 5;
@@ -163,11 +167,34 @@ fn palm_centroid(lm: &[[f32; 3]]) -> [f32; 2] {
     [sum[0] / 3.0, sum[1] / 3.0]
 }
 
-/// Tilt of the fingers about the wrist in degrees. Positive = leaning right.
-fn hand_tilt_deg(lm: &[[f32; 3]]) -> f32 {
-    let dx = lm[9][0] - lm[0][0];
-    let dy = lm[9][1] - lm[0][1]; // y grows downward
-    dx.atan2(-dy).to_degrees()
+/// Outcome of one swipe-tracking step.
+enum SwipeOutcome {
+    /// Keep accumulating; the hand is mid-swipe.
+    Hold,
+    /// Fire a workspace switch toward this direction, re-anchoring here.
+    Fire(&'static str),
+    /// Not swiping: ease the anchor toward the hand so stale travel decays.
+    Reanchor([f32; 2]),
+}
+
+const SWIPE_REANCHOR: f32 = 0.05; // anchor easing per non-swiping frame
+
+/// Pure swipe logic: given the current anchor and hand position/velocity,
+/// decide whether to fire a switch, keep holding, or re-anchor.
+fn swipe_step(anchor: [f32; 2], pos: [f32; 2], vx: f32, vy: f32) -> SwipeOutcome {
+    let swiping = vx.abs() > SWIPE_VEL && vx.abs() > DOMINANCE * vy.abs();
+    if !swiping {
+        return SwipeOutcome::Reanchor([
+            anchor[0] + SWIPE_REANCHOR * (pos[0] - anchor[0]),
+            anchor[1] + SWIPE_REANCHOR * (pos[1] - anchor[1]),
+        ]);
+    }
+    let dx = pos[0] - anchor[0];
+    if dx.abs() >= SWIPE_DIST {
+        SwipeOutcome::Fire(if dx > 0.0 { "right" } else { "left" })
+    } else {
+        SwipeOutcome::Hold
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -238,8 +265,7 @@ struct Controller {
     fist_fired: bool,
     last_fist_fire: Instant,
 
-    tilt_ema: Option<f32>,
-    tilt_armed: bool,
+    swipe_anchor: Option<[f32; 2]>,
     vol_armed: bool,
     palm_since: Option<Instant>,
     last_workspace_switch: Instant,
@@ -295,8 +321,7 @@ impl Controller {
             fist_since: None,
             fist_fired: false,
             last_fist_fire: Instant::now(),
-            tilt_ema: None,
-            tilt_armed: true,
+            swipe_anchor: None,
             vol_armed: true,
             palm_since: None,
             last_workspace_switch: Instant::now(),
@@ -321,8 +346,7 @@ impl Controller {
     fn on_hand_lost(&mut self) {
         self.cursor_ema = None;
         self.hist.clear();
-        self.tilt_ema = None;
-        self.tilt_armed = true;
+        self.swipe_anchor = None;
         self.vol_armed = true;
         self.scroll_last_y = None;
         self.scroll_acc = 0.0;
@@ -336,6 +360,10 @@ impl Controller {
 
     fn set_mode(&mut self, m: Mode) {
         if self.mode != m {
+            // Leaving palm mode invalidates swipe tracking.
+            if self.mode == Mode::Palm && m != Mode::Palm {
+                self.swipe_anchor = None;
+            }
             self.mode = m;
             match m {
                 Mode::Cursor => self.cursor_ema = None, // snap on entry, no glide
@@ -345,7 +373,6 @@ impl Controller {
                 Mode::Palm => {
                     self.palm_since = Some(Instant::now());
                     self.hist.clear();
-                    self.tilt_ema = None;
                 }
                 _ => {}
             }
@@ -473,7 +500,7 @@ impl Controller {
             Mode::Idle => {
                 self.scroll_acc = 0.0;
                 self.scroll_last_y = None;
-                self.tilt_ema = None;
+                self.swipe_anchor = None;
             }
         }
 
@@ -571,8 +598,8 @@ impl Controller {
         Ok(())
     }
 
-    /// Open palm: horizontal tilt-wave switches workspace, vertical flip
-    /// steps volume. Both require real velocity along their axis.
+    /// Open palm: a horizontal swipe switches workspace, a vertical flip
+    /// steps volume. Both need genuine motion along their axis.
     fn handle_palm(
         &mut self,
         lm: &[[f32; 3]],
@@ -580,47 +607,35 @@ impl Controller {
         vy: f32,
         now: Instant,
     ) -> Result<()> {
+        let pos = palm_centroid(lm);
+
         // Ignore the first moments of palm mode so residual motion from
-        // pointing can't fire workspace/volume gestures.
+        // pointing can't fire workspace/volume gestures. Anchor the swipe
+        // only after settling.
         if now.duration_since(self.palm_since.unwrap_or(now)) < PALM_SETTLE {
+            self.swipe_anchor = Some(pos);
             return Ok(());
         }
 
-        // --- Workspace via tilt-wave ---
-        let waving = vx.abs() > WAVE_VEL && vx.abs() > DOMINANCE * vy.abs();
-        if waving {
-            let raw = hand_tilt_deg(lm);
-            let smooth = match self.tilt_ema {
-                Some(t) => t + TILT_ALPHA * (raw - t),
-                None => raw,
-            };
-            self.tilt_ema = Some(smooth);
-
-            if self.debug {
-                eprintln!(
-                    "[TILT] raw={raw:+.1} smooth={smooth:+.1} vx={vx:+.2} armed={}",
-                    self.tilt_armed
-                );
-            }
-
-            if self.tilt_armed
-                && smooth.abs() >= TILT_FIRE_DEG
-                && now.duration_since(self.last_workspace_switch) > WORKSPACE_COOLDOWN
-            {
-                // Lean the hand toward your right -> workspace to the right.
-                let dir = if smooth > 0.0 { "right" } else { "left" };
-                self.switch_workspace(dir)?;
-                self.last_workspace_switch = now;
-                self.tilt_armed = false;
-            }
-        } else {
-            // Not waving: re-arm once the hand settles back near vertical.
-            if self.tilt_ema.map(|t| t.abs()).unwrap_or(0.0) < TILT_ARM_DEG {
-                self.tilt_armed = true;
-            }
-            if self.tilt_armed {
-                self.tilt_ema = None;
-            }
+        // --- Workspace via horizontal swipe ---
+        match self.swipe_anchor {
+            None => self.swipe_anchor = Some(pos),
+            Some(anchor) => match swipe_step(anchor, pos, vx, vy) {
+                SwipeOutcome::Hold => {}
+                SwipeOutcome::Reanchor(a) => self.swipe_anchor = Some(a),
+                SwipeOutcome::Fire(dir) => {
+                    if now.duration_since(self.last_workspace_switch) > WORKSPACE_COOLDOWN {
+                        self.switch_workspace(dir)?;
+                        self.last_workspace_switch = now;
+                    }
+                    // Re-anchor where the swipe ended, fired or not.
+                    self.swipe_anchor = Some(pos);
+                }
+            },
+        }
+        if self.debug {
+            let dx = pos[0] - self.swipe_anchor.unwrap_or(pos)[0];
+            eprintln!("[SWIPE] dx={dx:+.3} vx={vx:+.2} vy={vy:+.2}");
         }
 
         // --- Volume via vertical flip ---
@@ -1029,17 +1044,41 @@ mod tests {
     }
 
     #[test]
-    fn tilt_sign_uses_knuckle_direction() {
-        let mut lm = open_palm();
-        // Shift knuckles right of the wrist -> fingers lean right -> positive.
-        for i in 1..21 {
-            lm[i][0] += 0.15;
+    fn fast_horizontal_swipe_fires() {
+        let anchor = [0.5, 0.5];
+        // Swipe right fast and clean: crosses the distance threshold.
+        match swipe_step(anchor, [anchor[0] + SWIPE_DIST + 0.01, 0.5], 1.2, 0.1) {
+            SwipeOutcome::Fire(dir) => assert_eq!(dir, "right"),
+            _ => panic!("expected fire"),
         }
-        assert!(hand_tilt_deg(&lm) > 10.0);
-        let mut lm2 = open_palm();
-        for i in 1..21 {
-            lm2[i][0] -= 0.15;
+        // Same travel but below the speed gate -> no fire, just re-anchor.
+        assert!(matches!(
+            swipe_step(anchor, [anchor[0] + SWIPE_DIST + 0.01, 0.5], 0.1, 0.05),
+            SwipeOutcome::Reanchor(_)
+        ));
+    }
+
+    #[test]
+    fn slow_drift_never_fires_workspace() {
+        let anchor = [0.5, 0.5];
+        let mut a = anchor;
+        // Simulate many frames of slow rightward drift.
+        for _ in 0..600 {
+            match swipe_step(a, [a[0] + 0.001, a[1]], 0.15, 0.02) {
+                SwipeOutcome::Fire(_) => panic!("slow drift fired"),
+                SwipeOutcome::Reanchor(next) => a = next,
+                SwipeOutcome::Hold => {}
+            }
         }
-        assert!(hand_tilt_deg(&lm2) < -10.0);
+    }
+
+    #[test]
+    fn vertical_motion_does_not_fire_workspace() {
+        let anchor = [0.5, 0.5];
+        // Big horizontal displacement but vertical motion dominates.
+        assert!(matches!(
+            swipe_step(anchor, [anchor[0] + SWIPE_DIST, 0.7], 0.3, 1.5),
+            SwipeOutcome::Reanchor(_)
+        ));
     }
 }
