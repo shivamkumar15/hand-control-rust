@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -17,9 +19,19 @@ const MIN_HAND_SPAN: f32 = 0.06; // reject spurious tiny detections
 
 // Pinch clicks (thumb + index / thumb + middle). Fire when tips come close,
 // re-arm only after they separate again -> no machine-gun clicking.
-const PINCH_ON: f32 = 0.045;
-const PINCH_OFF: f32 = 0.08;
-const PINCH_PALM_REL: f32 = 0.30; // also relative to palm size
+//
+// Thresholds are palm-relative (so distance from the camera doesn't matter)
+// with an absolute floor/ceiling so tiny far-away hands still work.
+// Fire if EITHER the absolute or the relative distance is beaten; re-arm
+// only once BOTH are cleared, giving a wide hysteresis band.
+const PINCH_ON: f32 = 0.055;
+const PINCH_OFF: f32 = 0.095;
+const PINCH_PALM_REL_ON: f32 = 0.35; // fire when d < palm * this ...
+const PINCH_PALM_REL_OFF: f32 = 0.45; // ... re-arm when d > palm * this
+// The pinching finger must not be fully folded (touching the thumb
+// necessarily curls it, so demanding "fully extended" made real pinches
+// almost impossible). 90 deg = clearly not tucked into the palm.
+const PINCH_MIN_ANGLE_DEG: f32 = 90.0;
 const CLICK_COOLDOWN: Duration = Duration::from_millis(180);
 
 // Cursor: the full camera view (minus a small margin) maps to the whole
@@ -61,8 +73,15 @@ const FIST_MAX_WRIST_Y: f32 = 0.60; // fist must be raised; low/resting hands ne
 // Finger extension uses hysteresis: the angle must rise above FINGER_UP_DEG to
 // count as extended, then fall below FINGER_DOWN_DEG to count as folded. In
 // between, the previous state is kept, so borderline fingers stop flickering.
-const FINGER_UP_DEG: f32 = 140.0;
-const FINGER_DOWN_DEG: f32 = 122.0;
+// A tip-to-knuckle distance fallback (relative to palm size) rescues cases
+// where the angle alone is unreliable: finger aimed at the camera, hand
+// tilted, or noisy depth (z) from MediaPipe.
+const FINGER_UP_DEG: f32 = 135.0;
+const FINGER_DOWN_DEG: f32 = 115.0;
+// Extension ratio = dist(tip, mcp) / palm_size. Clearly spread > 0.6,
+// clearly curled < 0.4, dead-band in between (keeps previous state).
+const EXT_RATIO_UP: f32 = 0.60;
+const EXT_RATIO_DOWN: f32 = 0.42;
 
 // A candidate mode must be seen this many consecutive frames before it
 // replaces the current one. Kills single-frame misreads that used to fire
@@ -80,6 +99,14 @@ const AFTER_CLAP_WINDOW: Duration = Duration::from_millis(2500);
 const SHUTDOWN_DOWN_THRESHOLD: f32 = 0.22;
 const SHUTDOWN_COOLDOWN: Duration = Duration::from_secs(5);
 
+// Voice command: saying "shutdown now" powers off. Final hypotheses must be
+// matched, but partials fire too so the command works even while you keep
+// talking. Matched words are consumed from the buffer so leftovers can't
+// re-trigger.
+const VOICE_CMD_WORDS: [&str; 2] = ["shutdown", "now"];
+const VOICE_PARTIAL_MIN_LEN: usize = 7; // "shutdown now".len()
+const VOICE_COOLDOWN: Duration = Duration::from_secs(10);
+
 // ---------------------------------------------------------------------------
 // Landmark data from Python tracker
 // ---------------------------------------------------------------------------
@@ -94,11 +121,29 @@ struct Frame {
     hands: Vec<Hand>,
 }
 
+/// One line from voice.py
+#[derive(Deserialize, Debug)]
+struct VoiceEvent {
+    text: String,
+    #[serde(default)]
+    partial: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Geometry helpers
 // ---------------------------------------------------------------------------
 fn dist(a: &[f32; 3], b: &[f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
+}
+
+/// Full 3D tip distance (includes depth). Pinch tips coincide in x/y but
+/// MediaPipe still reports a small z gap; including z with a mild weight
+/// keeps far/near hands comparable without letting noisy z dominate.
+fn dist_pinch(a: &[f32; 3], b: &[f32; 3]) -> f32 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = (a[2] - b[2]) * 0.5;
+    (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
 fn dist2d(a: &[f32; 2], b: &[f32; 2]) -> f32 {
@@ -147,15 +192,54 @@ fn finger_angles(lm: &[[f32; 3]]) -> [f32; 5] {
     ]
 }
 
-/// Hysteresis step for one finger's extended state.
-fn hysteresis_step(prev: bool, angle: f32) -> bool {
-    if angle >= FINGER_UP_DEG {
+/// Hysteresis step for one finger's extended state, combining two cues:
+/// the PIP joint angle and the tip-to-knuckle spread (relative to palm).
+/// Either cue can force a decision; when both are in the dead-band the
+/// previous state is kept, so borderline fingers stop flickering.
+fn hysteresis_step(prev: bool, angle: f32, ratio: f32) -> bool {
+    let angle_up = angle >= FINGER_UP_DEG;
+    let angle_down = angle <= FINGER_DOWN_DEG;
+    let ratio_up = ratio >= EXT_RATIO_UP;
+    let ratio_down = ratio <= EXT_RATIO_DOWN;
+    if angle_up || ratio_up {
         true
-    } else if angle <= FINGER_DOWN_DEG {
+    } else if angle_down && ratio_down {
         false
+    } else if angle_down || ratio_down {
+        // One cue says folded, the other is undecided -> fold, unless we
+        // were clearly up and neither cue is strongly folded.
+        // Keep hysteresis tight: fold only if the angle is well below UP.
+        if angle <= FINGER_DOWN_DEG && ratio < EXT_RATIO_UP {
+            false
+        } else {
+            prev
+        }
     } else {
         prev
     }
+}
+
+/// Tip-to-knuckle spread per finger (thumb first), normalized by palm size.
+/// Extended ≈ 0.7–1.0, curled ≈ 0.3–0.5. Scale-free, so it works near/far.
+fn finger_ratios(lm: &[[f32; 3]], palm_size: f32) -> [f32; 5] {
+    const PAIRS: [(usize, usize); 5] = [(2, 4), (5, 8), (9, 12), (13, 16), (17, 20)];
+    let denom = palm_size.max(1e-4);
+    let mut out = [0.0; 5];
+    for (i, (mcp, tip)) in PAIRS.iter().enumerate() {
+        out[i] = dist(&lm[*mcp], &lm[*tip]) / denom;
+    }
+    out
+}
+
+/// Pinch fire/re-arm test with palm-relative hysteresis.
+/// Fire when tips are close by EITHER measure; re-arm only once they are
+/// far by BOTH measures, so the trigger doesn't chatter at the boundary.
+fn pinch_closed(d: f32, palm_size: f32) -> bool {
+    d < PINCH_ON || d < palm_size * PINCH_PALM_REL_ON
+}
+
+fn pinch_open(d: f32, palm_size: f32) -> bool {
+    d > PINCH_OFF && d > palm_size * PINCH_PALM_REL_OFF
 }
 
 fn palm_centroid(lm: &[[f32; 3]]) -> [f32; 2] {
@@ -205,6 +289,32 @@ enum Mode {
     Palm,
 }
 
+/// Match a voice command against an utterance. The utterance is normalized
+/// (lowercase, alphanumeric only) and the command words must appear in order,
+/// adjacent ("shut down now" also matches via the word list). Returns the
+/// normalized utterance with the matched words consumed, so a final result
+/// following a fired partial can't re-trigger.
+fn match_voice_command(utterance: &str) -> bool {
+    let norm: String = utterance
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect();
+    let words: Vec<&str> = norm.split_whitespace().collect();
+    if words.len() < VOICE_CMD_WORDS.len() {
+        return false;
+    }
+    'outer: for start in 0..=(words.len() - VOICE_CMD_WORDS.len()) {
+        for (i, cmd) in VOICE_CMD_WORDS.iter().enumerate() {
+            if words[start + i] != *cmd {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
+}
+
 impl Mode {
     fn label(self) -> &'static str {
         match self {
@@ -213,6 +323,31 @@ impl Mode {
             Mode::Scroll => "scroll",
             Mode::Palm => "palm",
         }
+    }
+}
+
+/// Forgiving pose classifier (pure, unit-testable).
+///
+/// - Cursor: index up, middle down. Ring/pinky wobble is ignored, so a
+///   slightly lifted ring finger no longer kills the cursor.
+/// - Scroll: index AND middle up, but NOT a full open palm (at least one
+///   of ring/pinky folded). Survives one borderline finger.
+/// - Palm: 3+ of the four fingers up.
+/// - Else Idle. Fist is handled by the caller (forces Idle).
+fn classify_mode(fingers: [bool; 5], fist_now: bool, fist_fired: bool) -> Mode {
+    if fist_now || fist_fired {
+        return Mode::Idle;
+    }
+    let (_, index, middle, ring, pinky) = (fingers[0], fingers[1], fingers[2], fingers[3], fingers[4]);
+    let ext_count = [index, middle, ring, pinky].iter().filter(|&&x| x).count();
+    if index && middle && !(ring && pinky) {
+        Mode::Scroll
+    } else if index && !middle {
+        Mode::Cursor
+    } else if ext_count >= 3 {
+        Mode::Palm
+    } else {
+        Mode::Idle
     }
 }
 
@@ -277,6 +412,7 @@ struct Controller {
     shutdown_window_until: Option<Instant>,
     right_hand_start_y: Option<f32>,
     last_shutdown: Option<Instant>,
+    last_voice_shutdown: Option<Instant>,
 }
 
 impl Controller {
@@ -332,6 +468,7 @@ impl Controller {
             shutdown_window_until: None,
             right_hand_start_y: None,
             last_shutdown: None,
+            last_voice_shutdown: None,
         })
     }
 
@@ -380,13 +517,14 @@ impl Controller {
         }
     }
 
-    /// Update per-finger extended states with hysteresis.
-    fn update_fingers(&mut self, lm: &[[f32; 3]]) -> [bool; 5] {
+    /// Update per-finger extended states with hysteresis (angle + spread).
+    fn update_fingers(&mut self, lm: &[[f32; 3]], palm_size: f32) -> ([bool; 5], [f32; 5], [f32; 5]) {
         let angles = finger_angles(lm);
-        for (i, &a) in angles.iter().enumerate() {
-            self.finger_up[i] = hysteresis_step(self.finger_up[i], a);
+        let ratios = finger_ratios(lm, palm_size);
+        for i in 0..5 {
+            self.finger_up[i] = hysteresis_step(self.finger_up[i], angles[i], ratios[i]);
         }
-        self.finger_up
+        (self.finger_up, angles, ratios)
     }
 
     fn process(&mut self, lm: &[[f32; 3]]) -> Result<()> {
@@ -396,18 +534,11 @@ impl Controller {
         }
 
         let now = Instant::now();
-        let fingers = self.update_fingers(lm);
+        let palm_size = dist(&lm[0], &lm[9]).max(1e-4);
+        let (fingers, angles, ratios) = self.update_fingers(lm, palm_size);
         let four = [fingers[1], fingers[2], fingers[3], fingers[4]];
         let ext_count = four.iter().filter(|&&x| x).count();
         let fist_now = ext_count == 0 && lm[0][1] < FIST_MAX_WRIST_Y;
-        let palm_size = dist(&lm[0], &lm[9]);
-
-        if self.debug {
-            eprintln!(
-                "[STATE] span={span:.3} palm={palm_size:.3} fingers={fingers:?} mode={:?}",
-                self.mode
-            );
-        }
 
         // Motion history for velocity estimates (rolling ~350ms window).
         self.hist.push_back(Sample { t: now, p: palm_centroid(lm) });
@@ -440,42 +571,58 @@ impl Controller {
         }
 
         // ---- Pinch clicks (suppressed while the hand is closing) ---------
+        // NOTE: the pinching finger only needs to be NOT-folded (angle >
+        // PINCH_MIN_ANGLE_DEG). Touching the thumb always curls the finger,
+        // so requiring "fully extended" rejected almost all real pinches.
         if !fist_now {
-            let d_left = dist(&lm[4], &lm[8]);
-            let d_right = dist(&lm[4], &lm[12]);
-            let rel = palm_size * PINCH_PALM_REL;
+            let d_left = dist_pinch(&lm[4], &lm[8]);
+            let d_right = dist_pinch(&lm[4], &lm[12]);
             let can_click = now.duration_since(self.last_click) > CLICK_COOLDOWN;
+            let index_open = angles[1] > PINCH_MIN_ANGLE_DEG;
+            let middle_open = angles[2] > PINCH_MIN_ANGLE_DEG;
 
-            // The triggering finger must be extended, otherwise a curled
-            // resting hand brings tips close together and fires phantom
-            // clicks.
-            if self.pinch_left_armed && can_click && fingers[1] && d_left < PINCH_ON.min(rel) {
+            if self.pinch_left_armed && can_click && index_open && pinch_closed(d_left, palm_size) {
                 self.do_click(Button::Left, "left click", now)?;
                 self.pinch_left_armed = false;
-            } else if d_left > PINCH_OFF {
+            } else if pinch_open(d_left, palm_size) {
                 self.pinch_left_armed = true;
             }
 
-            if self.pinch_right_armed && can_click && fingers[2] && d_right < PINCH_ON.min(rel) {
+            if self.pinch_right_armed && can_click && middle_open && pinch_closed(d_right, palm_size) {
                 self.do_click(Button::Right, "right click", now)?;
                 self.pinch_right_armed = false;
-            } else if d_right > PINCH_OFF {
+            } else if pinch_open(d_right, palm_size) {
                 self.pinch_right_armed = true;
+            }
+
+            if self.debug {
+                eprintln!(
+                    "[PINCH] L={d_left:.3} (armed={}) R={d_right:.3} (armed={}) idx_ang={:.0} mid_ang={:.0} palm={palm_size:.3}",
+                    self.pinch_left_armed, self.pinch_right_armed, angles[1], angles[2]
+                );
             }
         }
 
-        // ---- Mode selection (debounced) ----------------------------------
-        let new_mode = if fist_now || self.fist_fired {
-            Mode::Idle
-        } else if fingers[1] && fingers[2] && !fingers[3] && !fingers[4] {
-            Mode::Scroll
-        } else if fingers[1] && ext_count == 1 {
-            Mode::Cursor
-        } else if ext_count >= 3 {
-            Mode::Palm
-        } else {
-            Mode::Idle
-        };
+        // ---- Mode selection (debounced, forgiving) -------------------------
+        let new_mode = classify_mode(fingers, fist_now, self.fist_fired);
+        if self.debug {
+            eprintln!(
+                "[STATE] span={span:.3} palm={palm_size:.3} fingers={fingers:?} ang=[{:.0},{:.0},{:.0},{:.0},{:.0}] rat=[{:.2},{:.2},{:.2},{:.2},{:.2}] mode={:?} cand={:?}({}) ext={ext_count}",
+                angles[0],
+                angles[1],
+                angles[2],
+                angles[3],
+                angles[4],
+                ratios[0],
+                ratios[1],
+                ratios[2],
+                ratios[3],
+                ratios[4],
+                self.mode,
+                self.mode_candidate,
+                self.cand_frames
+            );
+        }
         // The candidate must repeat for MODE_CONFIRM_FRAMES consecutive
         // frames before it replaces the current mode.
         if new_mode == self.mode {
@@ -709,8 +856,33 @@ impl Controller {
         anyhow::bail!("no workspace-switching backend found (tried uinput, hyprctl and xdotool)");
     }
 
-    fn check_shutdown_gesture(&mut self, hands: &[Hand]) -> Result<()> {
+    /// Handle one utterance from voice.py. Partials fire early (so the
+    /// command triggers even if the final result lags or never comes),
+    /// finals are also checked; the cooldown blocks double-fires.
+    fn handle_voice_event(&mut self, ev: &VoiceEvent) -> Result<()> {
         let now = Instant::now();
+        if let Some(t) = self.last_voice_shutdown
+            && now.duration_since(t) < VOICE_COOLDOWN
+        {
+            return Ok(());
+        }
+
+        let matched = match_voice_command(&ev.text)
+            || (ev.partial
+                && ev.text.to_lowercase().trim().len() >= VOICE_PARTIAL_MIN_LEN
+                && match_voice_command(&ev.text));
+        if !matched {
+            if self.debug {
+                eprintln!("[VOICE] heard {:?} (no match)", ev.text);
+            }
+            return Ok(());
+        }
+
+        self.last_voice_shutdown = Some(now);
+        self.trigger_shutdown_voice(&ev.text)
+    }
+
+    fn check_shutdown_gesture(&mut self, hands: &[Hand]) -> Result<()> {        let now = Instant::now();
         if let Some(t) = self.last_shutdown && now.duration_since(t) < SHUTDOWN_COOLDOWN {
             return Ok(());
         }
@@ -773,22 +945,30 @@ impl Controller {
             return Ok(());
         }
 
-        eprintln!("!!! SHUTDOWN GESTURE DETECTED !!!");
+        eprintln!("!!! SHUTDOWN DETECTED !!!");
         eprintln!("Powering off in 2 seconds... (Ctrl+C to cancel)");
         std::thread::sleep(Duration::from_secs(2));
 
         self.reset_shutdown_state(Instant::now());
 
-        if Command::new("systemctl").arg("poweroff").status().is_ok() {
+        poweroff()
+    }
+
+    /// Voice-triggered shutdown: same action, different wording.
+    fn trigger_shutdown_voice(&mut self, heard: &str) -> Result<()> {
+        if self.dry_run {
+            println!("[GESTURE] voice shutdown: {heard:?} (dry-run, not executing)");
+            self.reset_shutdown_state(Instant::now());
             return Ok(());
         }
-        if Command::new("shutdown").args(["-h", "now"]).status().is_ok() {
-            return Ok(());
-        }
-        if Command::new("poweroff").status().is_ok() {
-            return Ok(());
-        }
-        anyhow::bail!("failed to shut down the system");
+
+        eprintln!("!!! VOICE COMMAND: {heard:?} !!!");
+        eprintln!("Powering off in 2 seconds... (Ctrl+C to cancel)");
+        std::thread::sleep(Duration::from_secs(2));
+
+        self.reset_shutdown_state(Instant::now());
+
+        poweroff()
     }
 
     fn reset_shutdown_state(&mut self, now: Instant) {
@@ -852,6 +1032,20 @@ fn command_exists(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Power the machine off, trying the usual suspects.
+fn poweroff() -> Result<()> {
+    if Command::new("systemctl").arg("poweroff").status().is_ok() {
+        return Ok(());
+    }
+    if Command::new("shutdown").args(["-h", "now"]).status().is_ok() {
+        return Ok(());
+    }
+    if Command::new("poweroff").status().is_ok() {
+        return Ok(());
+    }
+    anyhow::bail!("failed to shut down the system");
+}
+
 fn evdev_to_enigo_key(code: EvKey) -> Option<Key> {
     match code {
         EvKey::KEY_LEFTCTRL => Some(Key::Control),
@@ -864,6 +1058,44 @@ fn evdev_to_enigo_key(code: EvKey) -> Option<Key> {
     }
 }
 
+/// Spawn voice.py and stream its utterances over a channel. The listener is
+/// best-effort: if the mic or model is missing, the controller still runs
+/// with hand gestures only.
+fn spawn_voice_listener(python: &str, debug: bool) -> Option<mpsc::Receiver<VoiceEvent>> {
+    let child = Command::new(python)
+        .arg("voice.py")
+        .stdout(Stdio::piped())
+        .stderr(if debug { Stdio::inherit() } else { Stdio::null() })
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("voice listener not started: {e}");
+            return None;
+        }
+    };
+
+    let stdout = child.stdout.take()?;
+    let (tx, rx) = mpsc::channel::<VoiceEvent>();
+    thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            match serde_json::from_str::<VoiceEvent>(&line) {
+                Ok(ev) => {
+                    if tx.send(ev).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    });
+    Some(rx)
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -872,6 +1104,7 @@ fn main() -> Result<()> {
     let dry_run = args.iter().any(|a| a == "--dry-run");
     let debug = args.iter().any(|a| a == "--debug");
     let preview = args.iter().any(|a| a == "--preview");
+    let no_voice = args.iter().any(|a| a == "--no-voice");
     let camera = args
         .iter()
         .position(|a| a == "--camera")
@@ -882,7 +1115,7 @@ fn main() -> Result<()> {
     let python = std::env::var("AIR_MOUSE_PYTHON")
         .unwrap_or_else(|_| "/home/dranzer/hand-control/.venv/bin/python".into());
 
-    let mut cmd = Command::new(python);
+    let mut cmd = Command::new(&python);
     cmd.arg("tracker.py")
         .arg("--camera")
         .arg(&camera)
@@ -897,14 +1130,33 @@ fn main() -> Result<()> {
 
     let mut ctrl = Controller::new(dry_run, debug)?;
 
+    // Voice command listener: optional because a mic may not exist.
+    let voice_rx = if no_voice {
+        None
+    } else {
+        spawn_voice_listener(&python, debug)
+    };
+
     println!("Air Mouse (Rust controller) started.");
     println!("Screen: {}x{}", ctrl.screen_size.0, ctrl.screen_size.1);
     if dry_run {
         println!("Dry-run mode: no real mouse/key/volume actions.");
     }
+    if voice_rx.is_some() {
+        println!("Voice commands enabled: say \"shutdown now\" to power off.");
+    }
     println!("Press Ctrl+C to quit.");
 
     for line in reader.lines() {
+        // Drain any voice events that arrived since the last camera frame.
+        if let Some(rx) = &voice_rx {
+            while let Ok(ev) = rx.try_recv() {
+                if let Err(e) = ctrl.handle_voice_event(&ev) {
+                    eprintln!("voice error: {e:?}");
+                }
+            }
+        }
+
         let line = line.context("read failed")?;
         let frame: Frame = serde_json::from_str(&line).context("bad JSON")?;
 
@@ -916,12 +1168,19 @@ fn main() -> Result<()> {
             continue;
         }
 
-        // Prefer the right hand; fall back to any detected hand.
+        // Track the largest (closest) hand. Handedness labels flip when the
+        // frame is mirrored and MediaPipe mislabels at angles, so preferring
+        // "Right" made the cursor jump between hands. Biggest span = the
+        // hand the user is actively gesturing with.
         let primary = frame
             .hands
             .iter()
-            .find(|h| h.handedness.as_deref() == Some("Right"))
-            .or_else(|| frame.hands.first());
+            .filter(|h| h.landmarks.len() >= 21)
+            .max_by(|a, b| {
+                hand_span(&a.landmarks)
+                    .partial_cmp(&hand_span(&b.landmarks))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
 
         match primary {
             Some(hand) if hand.landmarks.len() >= 21 => {
@@ -972,7 +1231,15 @@ mod tests {
     }
 
     fn fingers_up(lm: &[[f32; 3]]) -> [bool; 5] {
-        finger_angles(lm).map(|a| a > FINGER_UP_DEG)
+        let palm = dist(&lm[0], &lm[9]).max(1e-4);
+        let angles = finger_angles(lm);
+        let ratios = finger_ratios(lm, palm);
+        let mut out = [false; 5];
+        for i in 0..5 {
+            // Fresh read without history: extended if either cue is strong.
+            out[i] = angles[i] >= FINGER_UP_DEG || ratios[i] >= EXT_RATIO_UP;
+        }
+        out
     }
 
     #[test]
@@ -1018,19 +1285,85 @@ mod tests {
 
     #[test]
     fn finger_hysteresis_holds_between_thresholds() {
-        let angles = [180.0, FINGER_UP_DEG + 1.0, 130.0, FINGER_DOWN_DEG - 1.0, 60.0];
-        let expected = [
-            true,  // straight -> up
-            true,  // above ON threshold -> up
-            true,  // inside band -> stays up (was up)
-            false, // below OFF threshold -> down
-            false, // curled -> down
-        ];
-        for (a, e) in angles.iter().zip(expected) {
-            assert_eq!(hysteresis_step(true, *a), e);
+        // Strong cues decide; dead-band keeps history.
+        assert!(hysteresis_step(true, 180.0, 0.8)); // straight -> up
+        assert!(hysteresis_step(true, FINGER_UP_DEG + 1.0, 0.5)); // angle ON -> up
+        assert!(hysteresis_step(true, 125.0, 0.8)); // ratio ON -> up
+        assert!(hysteresis_step(true, 125.0, 0.5)); // both mid -> stays up
+        assert!(!hysteresis_step(true, FINGER_DOWN_DEG - 1.0, 0.3)); // both OFF -> down
+        assert!(!hysteresis_step(false, 60.0, 0.3)); // curled -> down
+        // Same mid-band value keeps a previously-folded finger folded.
+        assert!(!hysteresis_step(false, 125.0, 0.5));
+    }
+
+    #[test]
+    fn curled_finger_has_small_spread_ratio() {
+        let mut lm = open_palm();
+        for b in [5, 9, 13, 17] {
+            curl(&mut lm, b);
         }
-        // Same band value keeps a previously-folded finger folded.
-        assert!(!hysteresis_step(false, 130.0));
+        let palm = dist(&lm[0], &lm[9]).max(1e-4);
+        let ratios = finger_ratios(&lm, palm);
+        for r in [ratios[1], ratios[2], ratios[3], ratios[4]] {
+            assert!(r < EXT_RATIO_UP, "curled ratio should be small, got {r}");
+        }
+        let open = open_palm();
+        let palm_o = dist(&open[0], &open[9]).max(1e-4);
+        let ro = finger_ratios(&open, palm_o);
+        for r in [ro[1], ro[2], ro[3], ro[4]] {
+            assert!(r >= EXT_RATIO_UP, "open ratio should be large, got {r}");
+        }
+    }
+
+    #[test]
+    fn pinch_uses_palm_relative_hysteresis() {
+        let palm = 0.20;
+        // Touching tips fire even though absolute distance alone is borderline.
+        assert!(pinch_closed(0.03, palm));
+        assert!(pinch_closed(0.060, palm)); // 0.06 < 0.20*0.35=0.07 -> fire
+        assert!(!pinch_closed(0.10, palm));
+        // Re-arm needs BOTH measures cleared.
+        assert!(pinch_open(0.10, palm)); // > 0.095 and > 0.09
+        assert!(!pinch_open(0.06, palm));
+    }
+
+    #[test]
+    fn pinch_allows_partially_curled_finger() {
+        // A real pinch curls the index to ~100-120 deg. The old gate
+        // (finger fully extended) rejected this; the new gate allows it.
+        assert!(110.0 > PINCH_MIN_ANGLE_DEG);
+        assert!(95.0 > PINCH_MIN_ANGLE_DEG);
+        assert!(70.0 < PINCH_MIN_ANGLE_DEG); // fully tucked still blocked
+    }
+
+    #[test]
+    fn mode_classifier_is_forgiving() {
+        // Pointing survives ring/pinky wobble.
+        assert_eq!(classify_mode([false, true, false, false, false], false, false), Mode::Cursor);
+        assert_eq!(classify_mode([false, true, false, true, false], false, false), Mode::Cursor);
+        assert_eq!(classify_mode([true, true, false, true, true], false, false), Mode::Cursor);
+        // Scroll survives one borderline finger.
+        assert_eq!(classify_mode([false, true, true, false, false], false, false), Mode::Scroll);
+        assert_eq!(classify_mode([false, true, true, true, false], false, false), Mode::Scroll);
+        assert_eq!(classify_mode([false, true, true, false, true], false, false), Mode::Scroll);
+        // Full palm still palm.
+        assert_eq!(classify_mode([true, true, true, true, true], false, false), Mode::Palm);
+        assert_eq!(classify_mode([false, true, true, true, true], false, false), Mode::Palm);
+        // Fist forces idle.
+        assert_eq!(classify_mode([false, false, false, false, false], true, false), Mode::Idle);
+        assert_eq!(classify_mode([false, true, false, false, false], false, true), Mode::Idle);
+    }
+
+    #[test]
+    fn pointing_pose_classifies_to_cursor() {
+        let mut lm = open_palm();
+        curl(&mut lm, 1);
+        for b in [9, 13, 17] {
+            curl(&mut lm, b);
+        }
+        let f = fingers_up(&lm);
+        assert_eq!((f[1], f[2], f[3], f[4]), (true, false, false, false));
+        assert_eq!(classify_mode(f, false, false), Mode::Cursor);
     }
 
     #[test]
@@ -1080,5 +1413,26 @@ mod tests {
             swipe_step(anchor, [anchor[0] + SWIPE_DIST, 0.7], 0.3, 1.5),
             SwipeOutcome::Reanchor(_)
         ));
+    }
+
+    #[test]
+    fn voice_command_matches() {
+        assert!(match_voice_command("shutdown now"));
+        assert!(match_voice_command("SHUTDOWN NOW"));
+        assert!(match_voice_command("Shutdown, now!"));
+        assert!(match_voice_command("please shutdown now"));
+        assert!(match_voice_command("shutdown now please"));
+        // Vosk may split it as two tokens or hear adjacent words.
+        assert!(match_voice_command("the shutdown now thing"));
+    }
+
+    #[test]
+    fn voice_command_rejects_near_misses() {
+        assert!(!match_voice_command("shutdown"));
+        assert!(!match_voice_command("now"));
+        assert!(!match_voice_command("shut down"));
+        assert!(!match_voice_command("shutdown the laptop now is off"));
+        assert!(!match_voice_command("how about shutting down"));
+        assert!(!match_voice_command(""));
     }
 }
