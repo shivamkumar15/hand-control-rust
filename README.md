@@ -8,7 +8,6 @@ Fast native controller for hand gesture laptop control.
 - **Python `voice.py`** — optional offline voice command listener (Vosk). Streams recognized utterances as JSON lines; the Rust side decides what they mean.
 - **Rust `air-mouse`** — reads the landmark stream, recognizes gestures, and drives the mouse/keyboard/volume with very low latency using a native uinput virtual device. It also spawns `voice.py` and reacts to voice commands.
 
-The heavy AI inference is still MediaPipe’s C++ engine; Python is just a thin wrapper. Moving the control loop to Rust removes Python GIL/input lag and makes the system feel much snappier.
 
 ## Run it
 
