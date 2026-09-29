@@ -49,7 +49,8 @@ Press **Ctrl+C** to stop.
 - **Adaptive smoothing** — slow hand = stable cursor, fast hand = instant tracking. The cursor snaps (no glide) each time you start pointing.
 - **Safe fist** — only a *raised* fist held ~0.4 s closes a tab, once per gesture. A resting or transitioning hand can never fire it.
 - **No phantom clicks** — pinch needs the finger actually extended; a curled resting hand is inert.
-- **Hysteresis finger reading** — finger angles are measured in 3D and use two thresholds, so slightly bent fingers still register and borderline fingers never flicker between gestures.
+- **Two-cue finger reading** — extension is scored 0–1 from two independent 3D measurements (PIP joint angle, tip-to-knuckle spread over palm size) and a finger counts as extended only when *both* agree. The PIP angle alone is blind to the DIP/TIP folding, which made half-curled fingers read as straight and turned ordinary pointing into a palm. Hysteresis on the score keeps borderline fingers from flickering.
+- **Pinch is not a fist** — a held click folds the fingers exactly like a fist, so an active pinch is excluded from the tab-close detector.
 - **Debounced modes** — a pose must hold for 3 consecutive frames before the mode changes, and palm gestures wait ~200 ms after engaging, so stray poses mid-motion can't fire clicks, volume or workspace switches.
 - **Displacement-based swipe** — workspace switching tracks how far your palm actually traveled, in the direction you swiped. Slow drift never fires, and the anchor decays when you stop, so stale distance can't fire later.
 - **Velocity-gated palm** — merely holding or rotating an open palm does nothing; you must genuinely swipe (workspace) or flip (volume) along the matching axis.
@@ -73,7 +74,8 @@ All knobs are constants at the top of `src/main.rs`:
 | Volume step size | `VOLUME_STEP` |
 | Fist too strict/loose | `FIST_HOLD`, `FIST_MAX_WRIST_Y` |
 | Gestures need perfectly straight fingers | lower `FINGER_UP_DEG` (and `FINGER_DOWN_DEG`) |
-| Finger states flicker between gestures | widen the `FINGER_UP_DEG` / `FINGER_DOWN_DEG` gap |
+| Finger states flicker between gestures | widen the `EXT_SCORE_UP` / `EXT_SCORE_DOWN` gap |
+| Pointing read as open palm | lower `EXT_RATIO_DOWN` (relaxed fingers must count as curled) |
 | Modes react too slowly | lower `MODE_CONFIRM_FRAMES` |
 | Stray actions right after opening the palm | raise `PALM_SETTLE` |
 

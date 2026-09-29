@@ -70,18 +70,22 @@ const FIST_HOLD: Duration = Duration::from_millis(400);
 const FIST_REARM: Duration = Duration::from_millis(400);
 const FIST_MAX_WRIST_Y: f32 = 0.60; // fist must be raised; low/resting hands never fire
 
-// Finger extension uses hysteresis: the angle must rise above FINGER_UP_DEG to
-// count as extended, then fall below FINGER_DOWN_DEG to count as folded. In
-// between, the previous state is kept, so borderline fingers stop flickering.
-// A tip-to-knuckle distance fallback (relative to palm size) rescues cases
-// where the angle alone is unreliable: finger aimed at the camera, hand
-// tilted, or noisy depth (z) from MediaPipe.
+// Finger extension combines two cues into one 0..1 score: the PIP joint
+// angle and the tip-to-knuckle spread relative to the palm. The score is
+// the weaker of the two (see extension_score), and hysteresis keeps the
+// previous state inside the EXT_SCORE band so borderline fingers stop
+// flickering between gestures.
 const FINGER_UP_DEG: f32 = 135.0;
 const FINGER_DOWN_DEG: f32 = 115.0;
 // Extension ratio = dist(tip, mcp) / palm_size. Clearly spread > 0.6,
-// clearly curled < 0.4, dead-band in between (keeps previous state).
+// clearly curled < 0.42, dead-band in between.
 const EXT_RATIO_UP: f32 = 0.60;
 const EXT_RATIO_DOWN: f32 = 0.42;
+// Score at or above this forces "extended", at or below forces "folded",
+// in between the previous state is kept. The asymmetric band (down
+// threshold lower than the up threshold) is what gives the hysteresis.
+const EXT_SCORE_UP: f32 = 0.60;
+const EXT_SCORE_DOWN: f32 = 0.35;
 
 // A candidate mode must be seen this many consecutive frames before it
 // replaces the current one. Kills single-frame misreads that used to fire
@@ -150,6 +154,16 @@ fn dist2d(a: &[f32; 2], b: &[f32; 2]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
 }
 
+/// 3D length with MediaPipe's z given a mild weight. z is noisier than x/y
+/// and in a different unit, so it must inform the result without dominating
+/// it. Used for orientation-invariant hand measurements (finger extension).
+fn dist3d(a: &[f32; 3], b: &[f32; 3]) -> f32 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = (a[2] - b[2]) * 0.5;
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
 fn hand_span(lm: &[[f32; 3]]) -> f32 {
     let mut min_x = f32::MAX;
     let mut max_x = f32::MIN;
@@ -192,41 +206,58 @@ fn finger_angles(lm: &[[f32; 3]]) -> [f32; 5] {
     ]
 }
 
-/// Hysteresis step for one finger's extended state, combining two cues:
-/// the PIP joint angle and the tip-to-knuckle spread (relative to palm).
-/// Either cue can force a decision; when both are in the dead-band the
-/// previous state is kept, so borderline fingers stop flickering.
+/// Rigid 3D hand scale, used to normalize finger extension. Unlike a
+/// projected (2D) palm width this does not shrink when the hand turns
+/// edge-on, so the extension ratio stays comparable at any orientation.
+fn palm_scale_3d(lm: &[[f32; 3]]) -> f32 {
+    dist3d(&lm[0], &lm[9]).max(1e-4)
+}
+
+/// How extended one finger is, in 0..1, from the two independent cues.
+/// The score is the MINIMUM of the cues: a finger can only be as extended
+/// as its least confident signal.
+///
+/// This must not be an OR of the cues. The PIP angle at lm[6] only spans
+/// MCP->PIP->TIP, so it stays large (~145 deg) even when the DIP and TIP
+/// fold in — a half-curled finger measured the "angle says up" way. Under
+/// an OR the angle therefore forced "extended" on its own and a pointing
+/// hand with relaxed fingers read as a fully open palm (which then hijacked
+/// the cursor with workspace/volume gestures). Taking the minimum makes the
+/// cues have to agree, so a fold the angle misses is still caught.
+fn extension_score(angle: f32, ratio: f32) -> f32 {
+    let a = ((angle - FINGER_DOWN_DEG) / (FINGER_UP_DEG - FINGER_DOWN_DEG)).clamp(0.0, 1.0);
+    let r = ((ratio - EXT_RATIO_DOWN) / (EXT_RATIO_UP - EXT_RATIO_DOWN)).clamp(0.0, 1.0);
+    a.min(r)
+}
+
+/// Hysteresis step for one finger's extended state. A confident score
+/// forces the new state; a mid-band score keeps the previous one, so
+/// borderline fingers still stop flickering between gestures.
 fn hysteresis_step(prev: bool, angle: f32, ratio: f32) -> bool {
-    let angle_up = angle >= FINGER_UP_DEG;
-    let angle_down = angle <= FINGER_DOWN_DEG;
-    let ratio_up = ratio >= EXT_RATIO_UP;
-    let ratio_down = ratio <= EXT_RATIO_DOWN;
-    if angle_up || ratio_up {
+    let score = extension_score(angle, ratio);
+    if score >= EXT_SCORE_UP {
         true
-    } else if angle_down && ratio_down {
+    } else if score <= EXT_SCORE_DOWN {
         false
-    } else if angle_down || ratio_down {
-        // One cue says folded, the other is undecided -> fold, unless we
-        // were clearly up and neither cue is strongly folded.
-        // Keep hysteresis tight: fold only if the angle is well below UP.
-        if angle <= FINGER_DOWN_DEG && ratio < EXT_RATIO_UP {
-            false
-        } else {
-            prev
-        }
     } else {
         prev
     }
 }
 
 /// Tip-to-knuckle spread per finger (thumb first), normalized by palm size.
-/// Extended ≈ 0.7–1.0, curled ≈ 0.3–0.5. Scale-free, so it works near/far.
-fn finger_ratios(lm: &[[f32; 3]], palm_size: f32) -> [f32; 5] {
+/// Extended ≈ 0.7–1.0, curled ≈ 0.25–0.4. Scale-free, so it works near/far.
+///
+/// The numerator is a 3D length: when a finger points at the camera its
+/// projected tip-to-knuckle distance collapses toward zero even though the
+/// finger is straight, which would have made the angle cue the only thing
+/// able to rescue it. Measuring the real 3D length keeps the cue honest in
+/// that case too.
+fn finger_ratios(lm: &[[f32; 3]], palm_scale: f32) -> [f32; 5] {
     const PAIRS: [(usize, usize); 5] = [(2, 4), (5, 8), (9, 12), (13, 16), (17, 20)];
-    let denom = palm_size.max(1e-4);
+    let denom = palm_scale.max(1e-4);
     let mut out = [0.0; 5];
     for (i, (mcp, tip)) in PAIRS.iter().enumerate() {
-        out[i] = dist(&lm[*mcp], &lm[*tip]) / denom;
+        out[i] = dist3d(&lm[*mcp], &lm[*tip]) / denom;
     }
     out
 }
@@ -279,6 +310,13 @@ fn swipe_step(anchor: [f32; 2], pos: [f32; 2], vx: f32, vy: f32) -> SwipeOutcome
     } else {
         SwipeOutcome::Hold
     }
+}
+
+/// A fist is "all four fingers folded and the hand raised". `pinching`
+/// excludes a held pinch, which folds the fingers the same way but is a
+/// click, not a tab close.
+fn is_fist(ext_count: usize, wrist_y: f32, pinching: bool) -> bool {
+    ext_count == 0 && !pinching && wrist_y < FIST_MAX_WRIST_Y
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -518,9 +556,9 @@ impl Controller {
     }
 
     /// Update per-finger extended states with hysteresis (angle + spread).
-    fn update_fingers(&mut self, lm: &[[f32; 3]], palm_size: f32) -> ([bool; 5], [f32; 5], [f32; 5]) {
+    fn update_fingers(&mut self, lm: &[[f32; 3]]) -> ([bool; 5], [f32; 5], [f32; 5]) {
         let angles = finger_angles(lm);
-        let ratios = finger_ratios(lm, palm_size);
+        let ratios = finger_ratios(lm, palm_scale_3d(lm));
         for i in 0..5 {
             self.finger_up[i] = hysteresis_step(self.finger_up[i], angles[i], ratios[i]);
         }
@@ -535,10 +573,21 @@ impl Controller {
 
         let now = Instant::now();
         let palm_size = dist(&lm[0], &lm[9]).max(1e-4);
-        let (fingers, angles, ratios) = self.update_fingers(lm, palm_size);
+        let (fingers, angles, ratios) = self.update_fingers(lm);
         let four = [fingers[1], fingers[2], fingers[3], fingers[4]];
         let ext_count = four.iter().filter(|&&x| x).count();
-        let fist_now = ext_count == 0 && lm[0][1] < FIST_MAX_WRIST_Y;
+
+        // Tip gaps for the pinch tests. Needed before the fist check, since
+        // a held pinch also curls every finger.
+        let d_left = dist_pinch(&lm[4], &lm[8]);
+        let d_right = dist_pinch(&lm[4], &lm[12]);
+        let pinching = pinch_closed(d_left, palm_size) || pinch_closed(d_right, palm_size);
+
+        // A pinch curls the fingers just like a fist does, so without this
+        // guard a held pinch on a raised hand read as a fist and closed a
+        // tab 0.4 s into the click. A fist has the thumb wrapped across the
+        // fingers; a pinch has the thumb on a fingertip.
+        let fist_now = is_fist(ext_count, lm[0][1], pinching);
 
         // Motion history for velocity estimates (rolling ~350ms window).
         self.hist.push_back(Sample { t: now, p: palm_centroid(lm) });
@@ -575,8 +624,6 @@ impl Controller {
         // PINCH_MIN_ANGLE_DEG). Touching the thumb always curls the finger,
         // so requiring "fully extended" rejected almost all real pinches.
         if !fist_now {
-            let d_left = dist_pinch(&lm[4], &lm[8]);
-            let d_right = dist_pinch(&lm[4], &lm[12]);
             let can_click = now.duration_since(self.last_click) > CLICK_COOLDOWN;
             let index_open = angles[1] > PINCH_MIN_ANGLE_DEG;
             let middle_open = angles[2] > PINCH_MIN_ANGLE_DEG;
@@ -1231,15 +1278,45 @@ mod tests {
     }
 
     fn fingers_up(lm: &[[f32; 3]]) -> [bool; 5] {
-        let palm = dist(&lm[0], &lm[9]).max(1e-4);
         let angles = finger_angles(lm);
-        let ratios = finger_ratios(lm, palm);
+        let ratios = finger_ratios(lm, palm_scale_3d(lm));
         let mut out = [false; 5];
         for i in 0..5 {
-            // Fresh read without history: extended if either cue is strong.
-            out[i] = angles[i] >= FINGER_UP_DEG || ratios[i] >= EXT_RATIO_UP;
+            // Fresh read with no history: exercise the real hysteresis step.
+            out[i] = hysteresis_step(false, angles[i], ratios[i]);
         }
         out
+    }
+
+    /// A finger at curl `c` in 0..1 (0 = straight, 1 = fully curled),
+    /// interpolated between the straight and curled landmark layouts.
+    fn curled_finger(x: f32, y: f32, c: f32) -> [[f32; 3]; 4] {
+        [
+            [x, y, 0.0],
+            [x, y - 0.08 + 0.06 * c, 0.0],
+            [x + 0.02 * c, y - 0.14 + 0.16 * c, 0.0],
+            [x + 0.04 * c, y - 0.20 + 0.24 * c, 0.0],
+        ]
+    }
+
+    /// Index straight, the other three at curl `c` — the realistic pointing
+    /// pose, where the unused fingers are relaxed rather than tucked.
+    fn pointing_with_relaxed_fingers(c: f32) -> [[f32; 3]; 21] {
+        let mut lm = open_palm();
+        // Thumb resting against the curled fingers, as when pointing.
+        lm[3] = [0.40, 0.74, 0.0];
+        lm[4] = [0.41, 0.70, 0.0];
+        for (i, base) in [5usize, 9, 13, 17].iter().enumerate() {
+            let col = i as f32;
+            let x = 0.44 + col * 0.055;
+            let y = 0.70 - col * 0.02;
+            let curl = if base == &5 { 0.0 } else { c };
+            let f = curled_finger(x, y, curl);
+            for k in 0..4 {
+                lm[base + k] = f[k];
+            }
+        }
+        lm
     }
 
     #[test]
@@ -1284,6 +1361,133 @@ mod tests {
     }
 
     #[test]
+    fn foreshortened_finger_reads_extended_end_to_end() {
+        // Both cues must agree for a finger aimed at the camera: the 3D
+        // angle is ~180 and the 3D tip-to-knuckle length is full size, so
+        // the min-score is high and the finger reads as extended.
+        let mut lm = open_palm();
+        lm[5][2] = 0.00;
+        lm[6][2] = 0.05;
+        lm[7][2] = 0.10;
+        lm[8][2] = 0.15;
+        assert!(fingers_up(&lm)[1], "foreshortened index read as folded");
+    }
+
+    #[test]
+    fn half_curled_finger_is_not_reported_as_extended() {
+        // Regression: the PIP angle alone stays > 135 deg when only the
+        // DIP/TIP fold, so an OR of the cues called a half-curled finger
+        // "extended" and every pointing hand became an open palm.
+        for c in [0.5, 0.6, 0.75] {
+            let lm = pointing_with_relaxed_fingers(c);
+            let f = fingers_up(&lm);
+            assert!(
+                !f[2] && !f[3] && !f[4],
+                "relaxed fingers at curl {c} read as extended: {f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pointing_with_relaxed_fingers_is_cursor_not_palm() {
+        // The end-to-end symptom: a natural pointing pose must drive the
+        // cursor and must not engage the palm (workspace/volume) gestures.
+        // c = 0.4 is the measured boundary where both cues agree the
+        // relaxed fingers are folded. Lower curls are excluded on purpose:
+        // fingers that straight genuinely ARE an open palm, not a point.
+        for c in [0.4, 0.5, 0.75, 1.0] {
+            let f = fingers_up(&pointing_with_relaxed_fingers(c));
+            assert_eq!(
+                classify_mode(f, false, false),
+                Mode::Cursor,
+                "pointing pose at relaxed curl {c} misread from {f:?}"
+            );
+        }
+        // ...and a genuinely open hand still reads as a palm.
+        let open = fingers_up(&pointing_with_relaxed_fingers(0.0));
+        assert_eq!(classify_mode(open, false, false), Mode::Palm);
+    }
+
+    #[test]
+    fn two_finger_scroll_pose_is_still_scroll() {
+        // The fix for pointing must not break the scroll pose it overlaps.
+        for c in [0.5, 0.75, 1.0] {
+            let mut lm = pointing_with_relaxed_fingers(c);
+            // Straighten the middle finger back out.
+            let m = curled_finger(0.495, 0.68, 0.0);
+            for k in 0..4 {
+                lm[9 + k] = m[k];
+            }
+            let f = fingers_up(&lm);
+            assert_eq!(
+                classify_mode(f, false, false),
+                Mode::Scroll,
+                "scroll pose at rest-finger curl {c} misread from {f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extension_score_is_independent_of_hand_size() {
+        // Both cues are lengths/ratios, so a hand twice as far from the
+        // camera (or twice as wide) must read exactly the same.
+        let scores: Vec<f32> = [0.6, 1.0, 1.8]
+            .iter()
+            .map(|s| {
+                let mut lm = pointing_with_relaxed_fingers(0.5);
+                for p in lm.iter_mut() {
+                    p[0] = 0.5 + (p[0] - 0.5) * s;
+                    p[1] = 0.5 + (p[1] - 0.5) * s;
+                }
+                extension_score(finger_angles(&lm)[2], finger_ratios(&lm, palm_scale_3d(&lm))[2])
+            })
+            .collect();
+        assert!(
+            scores.iter().all(|&s| (s - scores[0]).abs() < 1e-5),
+            "extension score varied with hand size: {scores:?}"
+        );
+    }
+
+    #[test]
+    fn relaxed_fingers_fold_even_after_an_open_palm() {
+        // Going from an open palm (all fingers up) straight to a point must
+        // drop the relaxed fingers rather than latching the palm pose.
+        let mut fingers = [true; 5];
+        let lm = pointing_with_relaxed_fingers(0.5);
+        let angles = finger_angles(&lm);
+        let ratios = finger_ratios(&lm, palm_scale_3d(&lm));
+        for i in 0..5 {
+            fingers[i] = hysteresis_step(fingers[i], angles[i], ratios[i]);
+        }
+        assert_eq!(
+            classify_mode(fingers, false, false),
+            Mode::Cursor,
+            "palm latched into a point: {fingers:?}"
+        );
+    }
+
+    #[test]
+    fn extension_score_takes_the_weaker_cue() {
+        // Angle maxed, spread says curled -> folded (the whole bug).
+        assert!(extension_score(180.0, 0.30) < EXT_SCORE_DOWN);
+        // Spread maxed, angle says curled -> folded.
+        assert!(extension_score(90.0, 0.95) < EXT_SCORE_DOWN);
+        // Both maxed -> extended.
+        assert!(extension_score(180.0, 0.95) >= EXT_SCORE_UP);
+        // Both agree it's folded -> folded.
+        assert!(extension_score(30.0, 0.20) < EXT_SCORE_DOWN);
+        // The cues disagree about a half-curled finger (the pointing case).
+        // Taking the minimum settles it as folded rather than deferring to
+        // the angle, which is what used to turn a point into a palm.
+        assert!(extension_score(146.0, 0.37) < EXT_SCORE_DOWN);
+        // The dead-band only holds when neither cue is decisive.
+        let mid = extension_score(125.0, 0.5);
+        assert!(mid > EXT_SCORE_DOWN && mid < EXT_SCORE_UP, "score {mid}");
+        assert!(hysteresis_step(true, 125.0, 0.5));
+        assert!(!hysteresis_step(false, 125.0, 0.5));
+    }
+
+    #[test]
     fn finger_hysteresis_holds_between_thresholds() {
         // Strong cues decide; dead-band keeps history.
         assert!(hysteresis_step(true, 180.0, 0.8)); // straight -> up
@@ -1302,17 +1506,26 @@ mod tests {
         for b in [5, 9, 13, 17] {
             curl(&mut lm, b);
         }
-        let palm = dist(&lm[0], &lm[9]).max(1e-4);
-        let ratios = finger_ratios(&lm, palm);
+        let ratios = finger_ratios(&lm, palm_scale_3d(&lm));
         for r in [ratios[1], ratios[2], ratios[3], ratios[4]] {
             assert!(r < EXT_RATIO_UP, "curled ratio should be small, got {r}");
         }
         let open = open_palm();
-        let palm_o = dist(&open[0], &open[9]).max(1e-4);
-        let ro = finger_ratios(&open, palm_o);
+        let ro = finger_ratios(&open, palm_scale_3d(&open));
         for r in [ro[1], ro[2], ro[3], ro[4]] {
             assert!(r >= EXT_RATIO_UP, "open ratio should be large, got {r}");
         }
+    }
+
+    #[test]
+    fn held_pinch_is_not_a_fist() {
+        // Regression: a pinch curls every finger exactly like a fist, so a
+        // held pinch on a raised hand used to close a tab after FIST_HOLD.
+        assert!(is_fist(0, 0.40, false), "raised closed hand is a fist");
+        assert!(!is_fist(0, 0.40, true), "held pinch must not close a tab");
+        // The "raised" requirement is unchanged.
+        assert!(!is_fist(0, 0.80, false), "low hand is not a fist");
+        assert!(!is_fist(1, 0.40, false), "open hand is not a fist");
     }
 
     #[test]
