@@ -107,4 +107,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (BrokenPipeError, KeyboardInterrupt):
+        # The Rust controller closed stdout / the user pressed Ctrl+C.
+        # The finally block in main() already released the camera.
+        os._exit(0)

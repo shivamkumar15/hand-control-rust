@@ -32,6 +32,11 @@ const PINCH_PALM_REL_OFF: f32 = 0.45; // ... re-arm when d > palm * this
 // necessarily curls it, so demanding "fully extended" made real pinches
 // almost impossible). 90 deg = clearly not tucked into the palm.
 const PINCH_MIN_ANGLE_DEG: f32 = 90.0;
+// A pinch must stay closed for this many consecutive frames before it
+// clicks. One noisy frame (poor light, motion blur) could otherwise land
+// both a borderline finger angle and a borderline tip distance at once and
+// fire a phantom click while pointing.
+const PINCH_CONFIRM_FRAMES: u32 = 2;
 const CLICK_COOLDOWN: Duration = Duration::from_millis(180);
 
 // Cursor: the full camera view (minus a small margin) maps to the whole
@@ -68,7 +73,18 @@ const VOLUME_STEP: u32 = 5;
 // opens again. Transitions through a half-closed hand never close tabs.
 const FIST_HOLD: Duration = Duration::from_millis(400);
 const FIST_REARM: Duration = Duration::from_millis(400);
-const FIST_MAX_WRIST_Y: f32 = 0.60; // fist must be raised; low/resting hands never fire
+// A raised fist has to be in the upper part of the frame. 0.72 still
+// excludes a hand resting on a desk/at the bottom edge, but doesn't demand
+// the arm be held uncomfortably high (a natural raised fist lands ~0.6-0.7).
+const FIST_MAX_WRIST_Y: f32 = 0.72;
+
+// A missed MediaPipe detection (motion blur, low light) should not reset the
+// whole controller. Keep the current mode/cursor through short gaps; only a
+// real hand loss after this grace period resets tracking.
+const HAND_LOST_GRACE: Duration = Duration::from_millis(250);
+// When two hands are visible, stay on the hand nearest its previous palm
+// position instead of switching to whichever hand happens to be larger.
+const HAND_SWITCH_DIST: f32 = 0.45;
 
 // Finger extension combines two cues into one 0..1 score: the PIP joint
 // angle and the tip-to-knuckle spread relative to the palm. The score is
@@ -114,7 +130,7 @@ const VOICE_COOLDOWN: Duration = Duration::from_secs(10);
 // ---------------------------------------------------------------------------
 // Landmark data from Python tracker
 // ---------------------------------------------------------------------------
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 struct Hand {
     landmarks: Vec<[f32; 3]>,
     handedness: Option<String>,
@@ -312,11 +328,69 @@ fn swipe_step(anchor: [f32; 2], pos: [f32; 2], vx: f32, vy: f32) -> SwipeOutcome
     }
 }
 
-/// A fist is "all four fingers folded and the hand raised". `pinching`
+/// Consecutive-closed-frame counter for one pinch. A single noisy frame must
+/// not click; when the tips separate the counter restarts.
+fn pinch_frame_step(frames: u32, closed: bool) -> u32 {
+    if closed {
+        frames.saturating_add(1)
+    } else {
+        0
+    }
+}
+
+fn pinch_should_fire(armed: bool, can_click: bool, closed_frames: u32) -> bool {
+    armed && can_click && closed_frames >= PINCH_CONFIRM_FRAMES
+}
+
+/// Whether either pinch is active. A pinch only counts when the finger
+/// doing the pinching is actually not folded: in a fist the thumb tip also
+/// sits right next to the folded index/middle tips, so a bare distance test
+/// made every fist look like a held pinch.
+fn pinch_active(
+    index_open: bool,
+    d_index: f32,
+    middle_open: bool,
+    d_middle: f32,
+    palm_size: f32,
+) -> bool {
+    (index_open && pinch_closed(d_index, palm_size))
+        || (middle_open && pinch_closed(d_middle, palm_size))
+}
+
+/// A fist is "all five fingers folded and the hand raised". `pinching`
 /// excludes a held pinch, which folds the fingers the same way but is a
-/// click, not a tab close.
-fn is_fist(ext_count: usize, wrist_y: f32, pinching: bool) -> bool {
-    ext_count == 0 && !pinching && wrist_y < FIST_MAX_WRIST_Y
+/// click, not a tab close. The thumb must be folded too: a raised thumbs-up
+/// also has the four fingers folded and must not close a tab.
+fn is_fist(ext_count: usize, thumb_up: bool, wrist_y: f32, pinching: bool) -> bool {
+    ext_count == 0 && !thumb_up && !pinching && wrist_y < FIST_MAX_WRIST_Y
+}
+
+/// Pick the hand to control. Prefer the hand closest to the previous palm
+/// position (this keeps tracking stable when a second hand/arm is in view);
+/// fall back to the largest hand when starting fresh or after a real loss.
+fn pick_primary(hands: &[Hand], prev_palm: Option<[f32; 2]>) -> Option<&Hand> {
+    let valid = || {
+        hands
+            .iter()
+            .filter(|h| h.landmarks.len() >= 21 && hand_span(&h.landmarks) >= MIN_HAND_SPAN)
+    };
+
+    if let Some(prev) = prev_palm
+        && let Some((_, hand)) = valid()
+            .filter_map(|h| {
+                let d = dist2d(&palm_centroid(&h.landmarks), &prev);
+                (d <= HAND_SWITCH_DIST).then_some((d, h))
+            })
+            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+    {
+        return Some(hand);
+    }
+
+    valid().max_by(|a, b| {
+        hand_span(&a.landmarks)
+            .partial_cmp(&hand_span(&b.landmarks))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -422,10 +496,16 @@ struct Controller {
     finger_up: [bool; 5],
     last_status: String,
 
+    /// Last frame that contained a usable hand, used to ride out short
+    /// detection gaps without resetting modes/cursor.
+    last_hand_seen: Option<Instant>,
+
     cursor_ema: Option<[f32; 2]>,
 
     pinch_left_armed: bool,
     pinch_right_armed: bool,
+    pinch_left_frames: u32,
+    pinch_right_frames: u32,
     last_click: Instant,
 
     hist: VecDeque<Sample>,
@@ -484,9 +564,12 @@ impl Controller {
             cand_frames: 0,
             finger_up: [false; 5],
             last_status: String::new(),
+            last_hand_seen: None,
             cursor_ema: None,
             pinch_left_armed: true,
             pinch_right_armed: true,
+            pinch_left_frames: 0,
+            pinch_right_frames: 0,
             last_click: Instant::now(),
             hist: VecDeque::with_capacity(64),
             scroll_entered: None,
@@ -526,11 +609,37 @@ impl Controller {
         self.scroll_last_y = None;
         self.scroll_acc = 0.0;
         self.fist_since = None;
+        self.fist_fired = false;
         self.finger_up = [false; 5];
         self.mode_candidate = None;
         self.cand_frames = 0;
         self.palm_since = None;
+        self.last_hand_seen = None;
+        // A hand that vanished mid-pinch should be able to click again as
+        // soon as it comes back, without waiting for a fresh open-close.
+        self.pinch_left_armed = true;
+        self.pinch_right_armed = true;
+        self.pinch_left_frames = 0;
+        self.pinch_right_frames = 0;
         self.set_mode(Mode::Idle);
+    }
+
+    /// Handle a frame without a hand. Short detection gaps (motion blur,
+    /// low light) keep the current state so the cursor doesn't snap and the
+    /// mode doesn't need to re-confirm. Returns true when the hand was
+    /// actually considered lost (state was reset).
+    fn on_hand_missing(&mut self, now: Instant) -> bool {
+        if let Some(seen) = self.last_hand_seen
+            && now.duration_since(seen) < HAND_LOST_GRACE
+        {
+            // Don't let the gap become fake motion when tracking resumes.
+            self.hist.clear();
+            self.scroll_last_y = None;
+            self.scroll_acc = 0.0;
+            return false;
+        }
+        self.on_hand_lost();
+        true
     }
 
     fn set_mode(&mut self, m: Mode) {
@@ -542,7 +651,12 @@ impl Controller {
             self.mode = m;
             match m {
                 Mode::Cursor => self.cursor_ema = None, // snap on entry, no glide
-                Mode::Scroll => self.scroll_entered = Some(Instant::now()),
+                Mode::Scroll => {
+                    self.scroll_entered = Some(Instant::now());
+                    // Never carry distance from a previous scroll session.
+                    self.scroll_last_y = None;
+                    self.scroll_acc = 0.0;
+                }
                 // Restart motion history so pointing speed doesn't leak into
                 // palm gesture detection.
                 Mode::Palm => {
@@ -566,12 +680,14 @@ impl Controller {
     }
 
     fn process(&mut self, lm: &[[f32; 3]]) -> Result<()> {
+        let now = Instant::now();
+        self.last_hand_seen = Some(now);
+
         let span = hand_span(lm);
         if span < MIN_HAND_SPAN {
             return Ok(());
         }
 
-        let now = Instant::now();
         let palm_size = dist(&lm[0], &lm[9]).max(1e-4);
         let (fingers, angles, ratios) = self.update_fingers(lm);
         let four = [fingers[1], fingers[2], fingers[3], fingers[4]];
@@ -581,13 +697,25 @@ impl Controller {
         // a held pinch also curls every finger.
         let d_left = dist_pinch(&lm[4], &lm[8]);
         let d_right = dist_pinch(&lm[4], &lm[12]);
-        let pinching = pinch_closed(d_left, palm_size) || pinch_closed(d_right, palm_size);
+        let index_open = angles[1] > PINCH_MIN_ANGLE_DEG;
+        let middle_open = angles[2] > PINCH_MIN_ANGLE_DEG;
+        // Only an unfolded finger can be pinching. In a fist the thumb tip
+        // also sits next to the folded index/middle tips, so the raw
+        // distance test alone made every fist look like a held pinch.
+        let pinching = pinch_active(index_open, d_left, middle_open, d_right, palm_size);
 
         // A pinch curls the fingers just like a fist does, so without this
         // guard a held pinch on a raised hand read as a fist and closed a
-        // tab 0.4 s into the click. A fist has the thumb wrapped across the
-        // fingers; a pinch has the thumb on a fingertip.
-        let fist_now = is_fist(ext_count, lm[0][1], pinching);
+        // tab 0.4 s into the click.
+        let fist_now = is_fist(ext_count, fingers[0], lm[0][1], pinching);
+
+        // Count consecutive closed frames for pinch confirmation. This runs
+        // even during a fist so a stale count can't survive into the next
+        // gesture.
+        let left_closed = index_open && pinch_closed(d_left, palm_size);
+        let right_closed = middle_open && pinch_closed(d_right, palm_size);
+        self.pinch_left_frames = pinch_frame_step(self.pinch_left_frames, left_closed);
+        self.pinch_right_frames = pinch_frame_step(self.pinch_right_frames, right_closed);
 
         // Motion history for velocity estimates (rolling ~350ms window).
         self.hist.push_back(Sample { t: now, p: palm_centroid(lm) });
@@ -625,17 +753,23 @@ impl Controller {
         // so requiring "fully extended" rejected almost all real pinches.
         if !fist_now {
             let can_click = now.duration_since(self.last_click) > CLICK_COOLDOWN;
-            let index_open = angles[1] > PINCH_MIN_ANGLE_DEG;
-            let middle_open = angles[2] > PINCH_MIN_ANGLE_DEG;
 
-            if self.pinch_left_armed && can_click && index_open && pinch_closed(d_left, palm_size) {
+            if pinch_should_fire(
+                self.pinch_left_armed,
+                can_click,
+                self.pinch_left_frames,
+            ) {
                 self.do_click(Button::Left, "left click", now)?;
                 self.pinch_left_armed = false;
             } else if pinch_open(d_left, palm_size) {
                 self.pinch_left_armed = true;
             }
 
-            if self.pinch_right_armed && can_click && middle_open && pinch_closed(d_right, palm_size) {
+            if pinch_should_fire(
+                self.pinch_right_armed,
+                can_click,
+                self.pinch_right_frames,
+            ) {
                 self.do_click(Button::Right, "right click", now)?;
                 self.pinch_right_armed = false;
             } else if pinch_open(d_right, palm_size) {
@@ -644,8 +778,13 @@ impl Controller {
 
             if self.debug {
                 eprintln!(
-                    "[PINCH] L={d_left:.3} (armed={}) R={d_right:.3} (armed={}) idx_ang={:.0} mid_ang={:.0} palm={palm_size:.3}",
-                    self.pinch_left_armed, self.pinch_right_armed, angles[1], angles[2]
+                    "[PINCH] L={d_left:.3} (armed={} frames={}) R={d_right:.3} (armed={} frames={}) idx_ang={:.0} mid_ang={:.0} palm={palm_size:.3}",
+                    self.pinch_left_armed,
+                    self.pinch_left_frames,
+                    self.pinch_right_armed,
+                    self.pinch_right_frames,
+                    angles[1],
+                    angles[2]
                 );
             }
         }
@@ -1194,6 +1333,10 @@ fn main() -> Result<()> {
     }
     println!("Press Ctrl+C to quit.");
 
+    // Last palm position of the hand we are controlling, used to stay with
+    // the same hand when a second one is visible.
+    let mut active_palm: Option<[f32; 2]> = None;
+
     for line in reader.lines() {
         // Drain any voice events that arrived since the last camera frame.
         if let Some(rx) = &voice_rx {
@@ -1205,7 +1348,17 @@ fn main() -> Result<()> {
         }
 
         let line = line.context("read failed")?;
-        let frame: Frame = serde_json::from_str(&line).context("bad JSON")?;
+        let frame: Frame = match serde_json::from_str(&line) {
+            Ok(frame) => frame,
+            Err(e) => {
+                // A truncated/garbled line should not take down the whole
+                // controller; just wait for the next one.
+                if debug {
+                    eprintln!("ignoring bad tracker line: {e}");
+                }
+                continue;
+            }
+        };
 
         if let Err(e) = ctrl.check_shutdown_gesture(&frame.hands) {
             eprintln!("shutdown gesture error: {e:?}");
@@ -1215,27 +1368,23 @@ fn main() -> Result<()> {
             continue;
         }
 
-        // Track the largest (closest) hand. Handedness labels flip when the
-        // frame is mirrored and MediaPipe mislabels at angles, so preferring
-        // "Right" made the cursor jump between hands. Biggest span = the
-        // hand the user is actively gesturing with.
-        let primary = frame
-            .hands
-            .iter()
-            .filter(|h| h.landmarks.len() >= 21)
-            .max_by(|a, b| {
-                hand_span(&a.landmarks)
-                    .partial_cmp(&hand_span(&b.landmarks))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-        match primary {
-            Some(hand) if hand.landmarks.len() >= 21 => {
+        // Stay on the hand we were already controlling. Handedness labels
+        // flip when the frame is mirrored and MediaPipe mislabels at angles,
+        // so labels are not reliable; picking the largest hand alone made the
+        // cursor jump to whichever hand happened to be bigger (e.g. a
+        // resting open hand vs. the pointing hand actually in use).
+        match pick_primary(&frame.hands, active_palm) {
+            Some(hand) => {
                 if let Err(e) = ctrl.process(&hand.landmarks) {
                     eprintln!("process error: {e:?}");
                 }
+                active_palm = Some(palm_centroid(&hand.landmarks));
             }
-            _ => ctrl.on_hand_lost(),
+            None => {
+                if ctrl.on_hand_missing(Instant::now()) {
+                    active_palm = None;
+                }
+            }
         }
     }
 
@@ -1521,11 +1670,81 @@ mod tests {
     fn held_pinch_is_not_a_fist() {
         // Regression: a pinch curls every finger exactly like a fist, so a
         // held pinch on a raised hand used to close a tab after FIST_HOLD.
-        assert!(is_fist(0, 0.40, false), "raised closed hand is a fist");
-        assert!(!is_fist(0, 0.40, true), "held pinch must not close a tab");
+        assert!(is_fist(0, false, 0.40, false), "raised closed hand is a fist");
+        assert!(
+            !is_fist(0, false, 0.40, true),
+            "held pinch must not close a tab"
+        );
         // The "raised" requirement is unchanged.
-        assert!(!is_fist(0, 0.80, false), "low hand is not a fist");
-        assert!(!is_fist(1, 0.40, false), "open hand is not a fist");
+        assert!(!is_fist(0, false, 0.80, false), "low hand is not a fist");
+        // A natural raised fist sits around y=0.66 in real MediaPipe output.
+        assert!(
+            is_fist(0, false, 0.661, false),
+            "natural raised fist should fire"
+        );
+        assert!(!is_fist(1, false, 0.40, false), "open hand is not a fist");
+        // A raised thumbs-up folds the other four fingers too, but it is not
+        // a fist and must not close a tab.
+        assert!(
+            !is_fist(0, true, 0.40, false),
+            "thumbs-up must not close a tab"
+        );
+    }
+
+    #[test]
+    fn fist_guard_ignores_folded_fingers() {
+        // Real MediaPipe fist: index PIP ~39 deg, tip~thumb gap small. The
+        // distance says "pinch", but the folded finger proves it isn't one.
+        let palm = 0.342;
+        let d_index = 0.068;
+        let d_middle = 0.070;
+        assert!(!pinch_active(false, d_index, false, d_middle, palm));
+        // A real pinch has the finger not folded, and then counts.
+        assert!(pinch_active(true, d_index, false, d_middle, palm));
+        assert!(pinch_active(false, d_index, true, d_middle, palm));
+        // Pointing: thumb sits next to the folded middle finger, so the
+        // right-tip distance is small, but the middle finger is folded.
+        assert!(!pinch_active(true, 0.301, false, 0.061, 0.284));
+    }
+
+    #[test]
+    fn pinch_needs_consecutive_closed_frames() {
+        // One noisy frame is not a click; two in a row is.
+        assert_eq!(pinch_frame_step(0, true), 1);
+        assert_eq!(pinch_frame_step(1, true), 2);
+        assert_eq!(pinch_frame_step(2, false), 0);
+        assert!(!pinch_should_fire(true, true, 1));
+        assert!(pinch_should_fire(true, true, PINCH_CONFIRM_FRAMES));
+        // A disarmed pinch stays disarmed until the tips separate.
+        assert!(!pinch_should_fire(false, true, 5));
+    }
+
+    /// Synthetic hand whose landmarks form a horizontal line `span` wide.
+    fn hand_at(cx: f32, span: f32) -> Hand {
+        let mut landmarks = vec![[0.0f32; 3]; 21];
+        for (i, p) in landmarks.iter_mut().enumerate() {
+            p[0] = cx + span * (i as f32 / 20.0);
+            p[1] = 0.5;
+        }
+        Hand {
+            landmarks,
+            handedness: None,
+        }
+    }
+
+    #[test]
+    fn hand_selection_stays_on_previous_hand() {
+        // The second hand is larger, but the first is the one we were using.
+        let active = hand_at(0.30, 0.15);
+        let other = hand_at(0.75, 0.30);
+        let prev = Some(palm_centroid(&active.landmarks));
+        let hands = [other.clone(), active.clone()];
+        let picked = pick_primary(&hands, prev).expect("a hand");
+        assert_eq!(picked.landmarks[0][0], active.landmarks[0][0]);
+        // With no history (startup) the largest hand still wins.
+        let hands = [other, active];
+        let picked = pick_primary(&hands, None).expect("a hand");
+        assert_eq!(picked.landmarks[0][0], 0.75);
     }
 
     #[test]

@@ -47,8 +47,10 @@ Press **Ctrl+C** to stop.
 
 - **No dead zones** — the full camera frame (small margin) controls the cursor, so resting your hand low in view still reaches the bottom of the screen.
 - **Adaptive smoothing** — slow hand = stable cursor, fast hand = instant tracking. The cursor snaps (no glide) each time you start pointing.
-- **Safe fist** — only a *raised* fist held ~0.4 s closes a tab, once per gesture. A resting or transitioning hand can never fire it.
-- **No phantom clicks** — pinch needs the finger actually extended; a curled resting hand is inert.
+- **Safe fist** — only a *raised* fist held ~0.4 s closes a tab, once per gesture. Every finger including the thumb must be folded, so a raised thumbs-up is not a fist. A resting or transitioning hand can never fire it.
+- **No phantom clicks** — pinch needs the pinching finger not folded (a curled resting hand is inert) and must stay closed for two consecutive frames, so one noisy detection can't click.
+- **Dropout tolerance** — a brief tracking miss (motion blur, low light) keeps the cursor and mode alive; state only resets after 250 ms without a hand.
+- **Stable hand choice** — once a hand is being controlled, the controller stays with the hand nearest its last palm position instead of jumping to a second/resting hand that happens to be larger.
 - **Two-cue finger reading** — extension is scored 0–1 from two independent 3D measurements (PIP joint angle, tip-to-knuckle spread over palm size) and a finger counts as extended only when *both* agree. The PIP angle alone is blind to the DIP/TIP folding, which made half-curled fingers read as straight and turned ordinary pointing into a palm. Hysteresis on the score keeps borderline fingers from flickering.
 - **Pinch is not a fist** — a held click folds the fingers exactly like a fist, so an active pinch is excluded from the tab-close detector.
 - **Debounced modes** — a pose must hold for 3 consecutive frames before the mode changes, and palm gestures wait ~200 ms after engaging, so stray poses mid-motion can't fire clicks, volume or workspace switches.
